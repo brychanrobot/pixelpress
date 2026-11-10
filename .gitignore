@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Environment and OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local test outputs and temporary scratch files
+scratch/
+output/
+*.tmp
+/tmp/

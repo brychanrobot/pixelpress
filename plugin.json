@@ -1,0 +1,19 @@
+{
+  "name": "pixelpress",
+  "version": "0.1.0",
+  "description": "Production-grade graphic and illustration tools for Antigravity (AGY), featuring knockout background removal, discrete screen-print color quantization, and directional alpha unmixing.",
+  "author": {
+    "name": "bryant"
+  },
+  "license": "MIT",
+  "keywords": [
+    "image-processing",
+    "screen-print",
+    "knockout",
+    "quantization",
+    "alpha-unmixing",
+    "graphic-design",
+    "vectorization",
+    "collinear-suppression"
+  ]
+}

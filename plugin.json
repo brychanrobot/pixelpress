@@ -1,19 +1,24 @@
 {
   "name": "pixelpress",
-  "version": "0.1.0",
-  "description": "Production-grade graphic and illustration tools for Antigravity (AGY), featuring knockout background removal, discrete screen-print color quantization, and directional alpha unmixing.",
+  "version": "0.2.0",
+  "description": "Production-grade graphic and illustration prepress tools for Antigravity (AGY), featuring Real-ESRGAN + Edge-Snap + VTracer Cutout SVG vectorization, Chroma-Smoothed PyMatting knockout background removal, and silkscreen spot-color quantization.",
   "author": {
     "name": "bryant"
   },
   "license": "MIT",
   "keywords": [
     "image-processing",
+    "vector",
+    "vtracer",
+    "svg",
+    "realesrgan",
     "screen-print",
     "knockout",
     "quantization",
     "alpha-unmixing",
     "graphic-design",
-    "vectorization",
-    "collinear-suppression"
+    "pymatting",
+    "color-line-projection",
+    "prepress"
   ]
 }

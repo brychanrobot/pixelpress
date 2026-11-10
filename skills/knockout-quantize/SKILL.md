@@ -5,53 +5,117 @@ description: Knockout background removal, continuous color decontaminating unmix
 
 # Knockout Background Removal, Continuous Unmixing & Discrete Color Quantization
 
-`knockout-quantize` is a mathematically rigorous CLI tool and workflow for decomposing raster graphic artwork (JPEG, PNG, WebP) into production-grade transparent PNGs with pristine, fringe-free edges. It supports two primary printing paradigms:
-
-1. **Digital DTG (Direct-to-Garment) & DTF (Direct-to-Film)**: Continuous local-envelope background unmixing and edge color decontamination without hard quantization, preserving subtle artist shading and multi-tone highlights.
-2. **Traditional Screen Printing (Spot-Color Separation)**: Solid-core Voronoi propagation and discrete $K$-color palette quantization for physical silkscreen separation.
+`knockout-quantize` is a mathematically rigorous CLI tool and workflow for decomposing graphic artwork (JPEG, PNG, WebP) into production-grade transparent PNGs and scalable cut-ready SVGs with pristine, fringe-free edges. Its primary, default workflow is **`--mode vector`** (Candidate B: Strict Spot-Color Ray Unmixing & `(K+1)`-Palette Quantization -> Cutout Spline VTracer SVG) designed specifically for vector-style artwork, graphic illustrations, anime, cel-shaded art, logos, and typography, alongside continuous raster unmixing modes (`dtg`, `dtf`, `screenprint`).
 
 ---
 
-## Step 0: Determine Target Printing Technology (DTG vs. DTF vs. Screen Printing)
+## Architecture & Mathematical Stages
 
-**Before running any background removal or color unmixing, ALWAYS determine or confirm the target printing technology:**
+The pipeline provides two distinct processing workflows depending on target printing technology:
 
-### 1. DTG (Direct-to-Garment, e.g. Kornit, Brother, Epson) / Digital Sublimation / Web
-- **Recommended Mode**: **Continuous Color Unmixing (`--mode dtg`)**
-- **Characteristics**: Prints continuous 24-bit CMYK+White ink droplets over an opaque white underbase.
-- **Unmixing Physics**:
-  1. Fits continuous 2D spatial background field $\vec{B}(y, x)$ from outer margins.
-  2. Computes continuous alpha matte $\alpha(y, x) \in [0, 1]$ scaled by local stroke contrast envelope.
-  3. Decontaminates anti-aliased edge colors by subtracting background bleed:
-     $$\vec{F}_{\text{unmixed}} = \text{clip}\left(\vec{B}(y, x) + \frac{\vec{C}(y, x) - \vec{B}(y, x)}{\max(\alpha, 0.02)},\; 0,\; 255\right)$$
-  4. Preserves 100% of smooth artist gradients and multi-tone highlights within stroke interiors while ensuring edge pixels contain zero background bleed.
+```
+[Graphic Artwork] ──> MODE: VECTOR (Primary Default)
+                           │
+                           ├──> Step 1: Real-ESRGAN 2x Upscaling/Denoising
+                           ├──> Step 2: Continuous 2D Background Field B(x, y) Fitting
+                           ├──> Step 3: Spot-Color Palette Determination (Explicit --palette or Auto-Discovery in CIELAB)
+                           ├──> Step 4: Strict Spot-Color Ray Unmixing & 7x7 Local Core Support (scipy.ndimage.maximum_filter)
+                           ├──> Step 5: Strictly Flat (K+1)-Color Raster Generation (Exact C_k or B)
+                           ├──> Step 6: Cutout Spline VTracer Vectorization (--hierarchical cutout --mode spline --filter_speckle 16)
+                           └──> Step 7: Background Path Removal & Canonical Hex Snapping (<= K Spot Inks) + resvg 300 DPI Render
 
-### 2. DTF (Direct-to-Film Transfers)
-- **Recommended Mode**: **Continuous Color Unmixing with Steep Falloff (`--mode dtg --alpha-power 1.3`)**
-- **Characteristics**: DTF hot-melt adhesive powder adheres to low-opacity pixels ($< 20\%$ opacity), creating faint glue halos around anti-aliased text.
-- **Remedy**: Apply an exponential gamma curve `--alpha-power 1.2` to `1.5` to steepen edge dropoff while maintaining smooth interior shading.
+[Raster Artwork]  ──> MODES: DTG / DTF / SCREENPRINT
+                           │
+                           ├──> Stage 1: CIELAB Chroma Smoothing
+                           ├──> Stage 2: Spatially Varying Background Field B(x, y)
+                           ├──> Stage 3: Topological Trimap (True bg_core + ROI Overrides)
+                           ├──> Stage 4: Closed-Form Matting + Known-B Color-Line Unmixing
+                           └──> Stage 5: Decoupled Print Mode Post-Processing (DTG / DTF / Screenprint)
 
-### 3. Traditional Screen Printing (Silkscreen Spot-Color Separation) / Vinyl / Embroidery
-- **Recommended Mode**: **Discrete Spot-Color Quantization (`--mode screenprint` / `--quantize`, default when palette is specified)**
-- **Characteristics**: Each ink color corresponds to a dedicated physical mesh screen and squeegee pass.
-- **Two-Regime Mathematical Physics**:
-  - **Step A — Solid Core Seeding**: True interior pixels of each ink are seeded by comparing Euclidean distance against the full palette plus the local background $\vec{B}(y, x)$, requiring ray projection $\alpha_k \ge 0.72$ and local gradient $\|\nabla \vec{C}\| < 25.0$. Collinear intermediate inks (e.g. Tan/Amber intermediate to high-contrast Cream/Gold) are strictly rejected on boundary slopes if local contrast reaches into the higher ink's regime.
-  - **Step B — Nearest-Core Voronoi Propagation**: Boundary anti-aliased edge pixels inherit their exact ink identity from their nearest solid core via `distance_transform_edt`. This guarantees that high-contrast strokes (e.g. light typography) maintain uniform ink identity all the way to their outer anti-aliased rim without intermediate ink hijacking.
-  - **Step C — Exact Ray-Projected Alpha**: Alpha is computed by directional ray projection along the propagated ink's vector $\vec{V}_k = \vec{F}_k - \vec{B}$. An adaptive noise gate ($\alpha_{\text{raw}} \le 0.18$) automatically wipes out JPEG mosquito ringing proportional to stroke contrast $L_k$.
-  - **Step D — Sub-Pixel Detail Preservation**: Fine 1–2px features (delicate stars, filigree, fine dots) that lack a wide solid core are seeded as whole connected components to their best-matching ink ray, and boosted via local ridge maximum filtering so thin strokes retain visibility.
-  - **Step E — Pure-Ink Boundary Color**: Every boundary pixel ($\alpha < 255$) uses 100% pure uncontaminated palette ink $\vec{F}_k$, guaranteeing zero background color bleed.
+[Both Pipelines]  ──> Stage 6: Prepress Verification (2x2 Sheet & 1:1 Native Resolution Crops)
+```
+
+### Stage 1: Edge-Preserving CIELAB Chroma Smoothing
+- Converts sRGB $[0, 1]$ into CIELAB.
+- Applies an edge-preserving bilateral filter strictly on chroma channels $a^*$ and $b^*$ ($d=7$, $\sigma_{\text{color}}=12.0$, $\sigma_{\text{space}}=5.0$).
+- Luminance $L^*$ remains 100% untouched, ensuring 1px hairlines and high-contrast edges remain razor-sharp while AI/JPEG DCT chroma blockiness is gently smoothed.
+- Enabled by default in `--mode dtg` and `--mode dtf`; can be toggled via `--no-chroma-smooth`.
+
+### Stage 2: Spatially Varying Background Field $B(x, y)$
+- Samples outer margin strips (`--border-pct 0.025`, default 2.5% of canvas).
+- Rejects foreground border intrusions via Median Absolute Deviation (MAD) in CIELAB space.
+- Fits a 2D degree-2 polynomial surface ($1, x, y, x^2, xy, y^2$) via Iteratively Reweighted Least Squares (IRLS) with Huber loss to model non-uniform vignette and lighting gradients.
+
+### Stage 3: Topological Two-Threshold Trimap with True Interior Protection
+- Computes perceptual CIELAB $\Delta E$ between chroma-smoothed artwork and $B(x, y)$.
+- **Candidate Background Seed**: $\Delta E \le t_{\text{bg}} + 3.0$ (default $t_{\text{bg}} = 6.5$).
+- **8-Connected Component Analysis**:
+  - **Exterior Background**: Components touching canvas perimeter are marked as exterior background.
+  - **Genuine Interior Cutouts & Counters**: Interior components with $\text{area} \ge 6$ px whose **25th-percentile $\Delta E \le t_{\text{bg}}$** are preserved as true background voids (e.g. inner loops of letters like 'o', 'e', 'a', gaps between foliage needles, or filigree cutouts). Dark interior painted shadows and creases whose $\Delta E$ merely dips to $10\text{–}18$ are rejected and stay solid.
+- **Declarative ROI Overrides**:
+  - `--protect-interior-box x0,y0,x1,y1`: Suppresses interior cutouts inside the box while still smoothly matting outer silhouettes against exterior background (ideal for enclosed objects with background-colored decorative stripes).
+  - `--protect-box x0,y0,x1,y1`: Forces definite foreground ($\text{trimap} = 1.0$) for low-contrast interior details.
+  - `--protect-poly x1,y1,x2,y2,x3,y3,...`: Forces definite solid foreground ($\text{trimap} = 1.0$) inside non-rectangular polygonal regions.
+  - `--seal-box x0,y0,x1,y1[:radius]`: Bridges narrow outline gaps (default radius 20px) to prevent exterior background flood leakage into subject interiors.
+  - `--cutout-box x0,y0,x1,y1`: Relaxes interior cutout acceptance ($\text{area} \ge 3$ px, 25th-percentile $\Delta E \le t_{\text{bg}} + 5.0$) for tiny, heavily anti-aliased negative space holes.
+- **Trimap Partitioning**:
+  - **Definite Background (`0.0`)**: 1px eroded true background plus pure exterior background islands ($\Delta E \le 0.85 t_{\text{bg}}$ at least 2px from foreground).
+  - **Definite Foreground (`1.0`)**: High-contrast eroded core ($\Delta E > t_{\text{fg}}$, default 40.0, 7x7 elliptical kernel radius 3px), deep topological interior ($\text{dist\_from\_potential\_bg} > 6.0$ px via geodesically connected potential background $\Delta E \le 22.0$), and 1px thin-stroke ridges ($\Delta E > t_{\text{thin}}$, default 32.0) validated against JPEG Gibbs ringing ripples via polarity-invariant local peak vector alignment ($((|L_{\text{img}} - L_{\text{bg}}| > 6.0) \lor (\Delta C > 10.0)) \land (\vec{v}_{\text{curr}} \cdot \vec{v}_{\text{dom}} > 0)$).
+  - **Unknown Band (`0.5`)**: Anti-aliased boundary transitions with sub-threshold soft-foot noise suppression.
+
+### Stage 4: Closed-Form Laplacian Matting + Two-Stage Known-$B$ Unmixing
+- Solves global matting Laplacian via `pymatting.estimate_alpha_cf` on the topological trimap.
+- Derives initial continuous foreground color field $\vec{F}_{\text{init}}$ via `pymatting.estimate_foreground_ml`.
+- In the unknown transition band ($\text{trimap} = 0.5$), computes exact directional vector projection onto the local color line $[\vec{B}, \vec{F}_{\text{init}}]$:
+  $$\alpha_{\text{proj}} = \text{clip}\left(\frac{(\vec{I} - \vec{B}) \cdot (\vec{F}_{\text{init}} - \vec{B})}{\|\vec{F}_{\text{init}} - \vec{B}\|^2 + \epsilon},\; 0.0,\; 1.0\right)$$
+- Projects out JPEG Gibbs undershoots and ringing by taking $\min(\alpha_{\text{cf}}, \alpha_{\text{proj}})$ where contrast $\|\vec{F}_{\text{init}} - \vec{B}\| > 0.06$.
+- Cleans alpha floor ($\alpha < 0.02 \to 0.0$) and ceiling ($\alpha > 0.985 \to 1.0$), and prunes isolated noise specks ($\text{area} \le 8$ px, $\alpha_{\max} < 0.55$).
+- Re-runs Stage-2 foreground decontamination $\vec{F}_{\text{final}} = \text{estimate\_foreground\_ml}(\vec{I}, \alpha_{\text{final}})$ and zeroes out RGB where $\alpha = 0$ for maximum PNG compression.
+
+### Stage 5: Strictly Decoupled Print Technology Post-Processing
+- **`--mode vector` (Candidate B: Strict Spot-Color Ray Unmixing & `(K+1)`-Palette Quantization -> Cutout Spline VTracer SVG, Primary Default)**:
+  Decomposes artwork into discrete spot-color ink channels with exact canonical hexes and zero color fragmentation:
+  1. Real-ESRGAN 2x neural denoising and upscaling.
+  2. Spatially varying polynomial background field $B(x, y)$ fitting.
+  3. Spot-color palette determination: explicit physical inks via `--palette "#RRGGBB,..."` or automatic K-means discovery in CIELAB space (`--inks K`, default 2..6 via silhouette scoring) sampled strictly from high-opacity interior pixels ($\text{dist\_to\_bg} \ge 40.0$ with 2px erosion) and consolidated via `--merge-hue-tol`.
+  4. Directional ray unmixing onto ink vectors $\vec{C}_k - \vec{B}$ with $7\times 7$ local core support dilation (`scipy.ndimage.maximum_filter`), eliminating boundary ringing while preserving $1\text{–}2$px filigree.
+  5. Strictly flat $(K+1)$-color RGB raster generation (exact $\vec{C}_k$ or $\vec{B}$, eliminating edge-snap boolean gravel).
+  6. Cutout spline vectorization via VTracer (`--colormode color --hierarchical cutout --mode spline --filter_speckle 16 --color_precision 8 --corner_threshold 55`).
+  7. Background path removal (paths closer to $B$ than any ink) and exact canonical hex snapping on every remaining path so the output SVG contains at most $K$ exact spot inks.
+  8. Native 1x 300 DPI transparent RGBA render via `resvg_py`.
+- **`--mode dtg` (Direct-to-Garment Raster)**:
+  Outputs continuous $\vec{F}_{\text{final}}$ and continuous $\alpha_{\text{final}}$ directly with ZERO palette quantization, preserving full 24-bit shading and smooth anti-aliased edges for photographic or continuous-tone artwork.
+- **`--mode dtf` (Direct-to-Film Transfers)**:
+  Maintains continuous foreground colors with a soft Hermite ramp on low-opacity pixels (`--dtf-alpha-floor 0.15`) to prevent hot-melt adhesive powder scatter on faint vapor while keeping edges crisp.
+- **`--mode screenprint` / `--quantize` (Spot-Color Silkscreen Separation)**:
+  Applies weighted K-means clustering (or maps to explicit `--palette`) on solid foreground pixels ($\alpha \ge 0.8$), snaps foreground pixels to the nearest spot ink in CIELAB space, and enforces binary/halftone-ready alpha ($\alpha \ge 0.5 \to 1.0$, else $0.0$).
+
+### Stage 6: Prepress Verification & 1:1 Native Resolution Crops
+- **`--verify-composite <path.png>` / `-p <path.png>`**:
+  Renders a 2x2 prepress inspection sheet:
+  1. Top-Left: Over Dark Charcoal (`#18181B`)
+  2. Top-Right: Over Clean White (`#FFFFFF`)
+  3. Bottom-Left: Over Warm Cream (`#F4EFE6`)
+  4. Bottom-Right: Alpha Matte Mask ($[\alpha, \alpha, \alpha]$)
+- **`--verify-crops-dir <dir>`**:
+  Automatically scores and extracts 4 diverse, non-overlapping 1:1 native-resolution diagnostic crops:
+  1. Thin Filigree & Fine Ridges
+  2. Transition & Unknown-Band Perimeter
+  3. Interior Cutouts & Counters
+  4. Outer Silhouette Edge Contrast
+  Saves each crop as a 4-column 1:1 strip (`Original | Over Dark #18181B | Over White #FFFFFF | Over Cream #F4EFE6`) with zero downscaling.
 
 ---
 
 ## Resolution & DPI Preservation Gate
 
-In prepress and screen printing production, downscaling or altering image resolution destroys fine mesh registration and causes blurred halftone dots:
+In prepress and apparel screen printing, downscaling or altering image resolution destroys mesh registration and blurs fine details:
 
 > [!IMPORTANT]
 > **Resolution & DPI Preservation Gate**:
-> 1. The output transparent PNG dimensions ($W \times H$) MUST strictly match the source raster image dimensions ($100\%$ pixel-identical, zero unintended downscaling).
-> 2. Original DPI metadata (`info.get('dpi')`, typically 72, 150, or 300 DPI) must be preserved in the output PNG header.
-> 3. If upscaling is explicitly requested for oversized garment prints or wide banners, use the optional `--scale <factor>` flag (e.g. `--scale 2`), which applies high-order Lanczos resampling.
+> 1. Output transparent PNG dimensions ($W \times H$) MUST strictly match source raster image dimensions ($100\%$ pixel-identical, zero unintended downscaling).
+> 2. Embedded DPI metadata (`info.get('dpi')`, default 300 DPI) must be preserved in the output PNG header.
+> 3. If enlargement is explicitly requested, use `--scale <factor>` for high-order Lanczos resampling.
 
 ---
 
@@ -68,85 +132,150 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 | Argument | Flag | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `input` | *(positional)* | *(required)* | Path to input image file (JPEG, PNG, WebP). |
-| `--output` | `-o` | `<stem>_transparent.png` | Destination path for output transparent PNG. |
-| `--preview` | `-p` | None (or `<stem>_preview.png`) | Path for 4-panel verification composite image. |
-| `--mode` | | `screenprint` | `screenprint` (discrete palette quantization) or `dtg` (continuous unmixing). |
-| `--quantize`| | `False` | Shortcut flag for `--mode screenprint`. |
-| `--palette` | | None | Comma-separated hex list of spot colors (e.g. `'#F5E0C9,#CC8F68,#E09622'`). |
-| `-k`, `--n-colors` | | None | Number of foreground ink colors to auto-discover if palette not provided. |
-| `--scale` | `--upscale`| `1` | Upscale factor using Lanczos resampling (default: 1, preserves native resolution). |
-| `--inspect` | | `False` | Inspect background plane, noise floor, and palette without writing files. |
-| `--bg-color` | | Auto | Manual background hex override (e.g. `'#181818'`). |
-| `--margin-pct`| | `0.03` (3%) | Outer border fraction used to fit the background plane. |
-| `--tau-low` | | `max(6.0, 3.5*sigma)` | Distance threshold below which pixels are 100% knocked out. |
-| `--alpha-solid`| | `0.85` | Ray projection factor for 100% solid interior opacity. |
-| `--alpha-knee` | | `0.18` | Directional projection deadzone knee for JPEG noise elimination. |
-| `--alpha-power`| | `1.0` | Alpha gamma exponent (1.2–1.5 for DTF adhesive falloff). |
-| `--despeckle`| | `20` | Minimum pixel island size for morphological cleanup. |
-| `--collinear-threshold` | | `0.75` | Cosine similarity threshold for detecting collinear inks. |
-| `--collinear-ratio` | | `0.88` | Norm ratio threshold for intermediate collinear inks. |
-| `--json` | | `False` | Output results in structured JSON format. |
-| `-v`, `--verbose`| | `False` | Enable diagnostic logging. |
+| `-o`, `--output` | | `<stem>_transparent.png` | Destination path for output transparent PNG. |
+| `--mode` | | `vector` | `vector` (Candidate B: Spot-Color Ray Unmixing + Cutout Spline VTracer SVG), `dtg` (continuous), `dtf` (firm alpha floor), or `screenprint` (spot colors). |
+| `--svg-output` | | `<stem>.svg` | Destination path for output SVG file in `--mode vector`. |
+| `--esrgan-model` | | `realesrgan-x4plus-anime` | Real-ESRGAN model (`realesrgan-x4plus-anime`, `realesr-animevideov3`, or `none`). |
+| `--vtracer-bin` | | Auto | Path to `vtracer` binary (auto-discovered from `PATH` or `~/.cargo/bin`). |
+| `--palette` | | None | Explicit comma-separated hex list of spot colors (e.g. `'#DDA032,#CBB39B,#EFE0CE'`). |
+| `--inks` | | `0` | Number of foreground spot inks ($K$) for `--mode vector` (default `0`: auto-discover 2..6 in CIELAB). |
+| `--filter-speckle` | | `16` | Discard patches smaller than $X$ px in VTracer cutout splines (default: 16). |
+| `--merge-hue-tol` | | `12.0` | CIELAB $\Delta E$ tolerance for merging similar hues during auto-palette discovery. |
+| `--svg-bg-thresh` | | `22.0` | CIELAB $\Delta E$ threshold for deleting background-matching SVG elements. |
+| `--scale` | `--upscale` | `1.0` | Optional upscale factor using Lanczos resampling. |
+| `--quantize` | | `False` | Shortcut for `--mode screenprint`. |
+| `-p`, `--verify-composite` | `--preview` | None | Path for 2x2 prepress verification composite sheet. |
+| `--verify-crops-dir` | | None | Directory to save 1:1 native-resolution diagnostic crop strips. |
+| `--crop` | | `[]` | Manual 1:1 crop specification `'x,y,w,h:label'` (repeatable). |
+| `-k`, `--colors` | | `8` | Number of spot-color inks for `--mode screenprint`. |
+| `--dtf-alpha-floor` | | `0.15` | Alpha floor ramp cutoff for DTF adhesive protection. |
+| `--chroma-smooth` | | `True` | Enable CIELAB bilateral chroma smoothing on $a^*$ and $b^*$. |
+| `--no-chroma-smooth` | | | Disable CIELAB bilateral chroma smoothing. |
+| `--chroma-sigma-color` | | `12.0` | Bilateral filter $\sigma_{\text{color}}$ for chroma channels. |
+| `--chroma-sigma-space` | | `5.0` | Bilateral filter $\sigma_{\text{space}}$ for chroma channels. |
+| `--border-pct` | | `0.025` (2.5%) | Outer border fraction used to fit background field $B(x, y)$. |
+| `--bg-color` | | Auto | Manual background hex override (e.g. `'#18181B'`). |
+| `--bg-thresh` | | `6.5` | $\Delta E$ threshold for background seed and interior cutout core validation. |
+| `--fg-thresh` | | `40.0` (25.0 in vector) | $\Delta E$ threshold for high-contrast foreground core. |
+| `--thin-thresh` | | `32.0` | $\Delta E$ threshold for thin 1–2px filigree ridge preservation. |
+| `--unknown-band-px` | | `6.0` | Euclidean distance boundary from true background into object interior. |
+| `--min-cutout-area` | | `6` | Minimum pixel area for accepting interior negative space cutouts. |
+| `--protect-interior-box`| | `[]` | Suppress interior cutout holes in `x0,y0,x1,y1` while preserving outer silhouette matting (repeatable). |
+| `--protect-box` | | `[]` | Force definite solid foreground (`trimap = 1.0`) in `x0,y0,x1,y1` (repeatable). |
+| `--protect-poly` | | `[]` | Force definite solid foreground (`trimap = 1.0`) inside polygon `'x1,y1,x2,y2,x3,y3,...'` (repeatable). |
+| `--seal-box` | | `[]` | Bridge outline gaps via morphological closing in `x0,y0,x1,y1[:radius]` (repeatable). |
+| `--cutout-box` | | `[]` | Relax interior cutout threshold in `x0,y0,x1,y1` for tiny holes (repeatable). |
+| `--json` | | `False` | Output summary statistics in structured JSON format. |
+| `-v`, `--verbose` | | `False` | Print diagnostic processing logs. |
 
 ---
 
 ## Standard Workflows
 
-### Workflow 1: Silkscreen Spot-Color Quantization (Screen Printing)
+### Workflow 1: Vector Prepress Knockout & Cutout SVG (Primary Default)
 
-When separating flat-color illustration artwork into exact spot-color inks:
+For vector-style artwork, graphic illustrations, anime, cel-shaded art, logos, and typography:
 
 ```bash
+# Auto-discover 2..6 spot inks via CIELAB silhouette scoring:
 uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
   artwork.jpg \
-  --palette "#F5E0C9,#CC8F68,#E09622,#97572A,#5E2615,#F3CF74" \
-  --mode screenprint \
+  --mode vector \
   -o artwork_transparent.png \
-  -p preview_composite.png
+  --svg-output artwork.svg \
+  -p preview_composite.png \
+  --verify-crops-dir ./crops
+
+# Or with an explicit physical spot-color palette:
+uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+  artwork.jpg \
+  --mode vector \
+  --palette "#DDA032,#CBB39B,#EFE0CE" \
+  -o artwork_transparent.png \
+  --svg-output artwork.svg \
+  -p preview_composite.png \
+  --verify-crops-dir ./crops
 ```
 
-### Workflow 2: Digital Direct-to-Garment (DTG) Unmixing
+### Workflow 2: Continuous DTG Digital Printing
 
-When preparing continuous-tone or painterly artwork for DTG digital printing:
+For digital direct-to-garment printing where artist gradients and continuous shading must be preserved without color banding:
 
 ```bash
 uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
   artwork.jpg \
   --mode dtg \
   -o artwork_transparent.png \
-  -p preview_dtg.png
+  -p preview_composite.png \
+  --verify-crops-dir ./crops
 ```
 
-### Workflow 3: Direct-to-Film (DTF) Transfer Preparation
+### Workflow 3: Direct-to-Film (DTF) Transfers
 
-For DTF heat transfers requiring steep adhesive falloff:
+For DTF heat transfers requiring a steeper alpha dropoff to prevent hot-melt adhesive powder from clinging to faint edge mist:
 
 ```bash
 uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
   artwork.jpg \
-  --mode dtg \
-  --alpha-power 1.3 \
+  --mode dtf \
+  --dtf-alpha-floor 0.15 \
   -o artwork_dtf.png \
-  -p preview_dtf.png
+  -p preview_dtf.png \
+  --verify-crops-dir ./crops
 ```
 
-### Workflow 4: Prepress Image Inspection
+### Workflow 4: Silkscreen Spot-Color Separation (Screen Printing)
 
-Inspect background uniformity, noise floor, and palette candidates before running full unmixing:
+When separating illustration artwork into discrete spot-color ink channels with binary mesh stencil boundaries:
 
 ```bash
 uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
-  artwork.jpg --inspect --palette "#F5E0C9,#CC8F68,#E09622"
+  artwork.jpg \
+  --mode screenprint \
+  --colors 6 \
+  -o artwork_screenprint.png \
+  -p preview_screenprint.png \
+  --verify-crops-dir ./crops
+```
+
+Or with an explicit physical spot-color palette:
+
+```bash
+uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+  artwork.jpg \
+  --mode screenprint \
+  --palette "#552308,#D08915,#F3D5BA,#824B21,#BE7A4F,#EDBB5F" \
+  -o artwork_screenprint.png \
+  -p preview_screenprint.png
 ```
 
 ---
 
-## Verification & 4-Panel Composite Review
+## Iterative ROI Refinement Workflow
 
-Every unmixing pass produces a 4-panel verification composite (`-p`) that MUST be inspected directly using `view_file`:
-1. **Panel 1 (Far-Left)**: Original raster input image.
-2. **Panel 2**: Transparent PNG composited over a high-contrast $20 \times 20$ checkerboard.
-3. **Panel 3**: Transparent PNG composited over Light Parchment (`#F7F4EB`).
-4. **Panel 4 (Far-Right)**: Transparent PNG composited over Dark Charcoal (`#181818`).
+When inspecting 1:1 detail crops or 2x2 verification sheets, apply targeted ROI overrides to resolve edge cases without altering global thresholds:
 
-Always review with `skills/print-image-review/SKILL.md` before final approval.
+### Case A: Enclosed Object with Background-Colored Decorative Stripes
+- **Symptom**: Decorative stripes inside an enclosed graphic (e.g. ribbon or banner stripes matching canvas background color) get hollowed out into negative space cutouts.
+- **Remedy**: Apply `--protect-interior-box 400,500,800,900`.
+- **Result**: Interior cutout holes inside the bounding box are suppressed, keeping the stripes 100% solid while outer boundaries continue to cleanly matte against the exterior background.
+
+### Case B: Tiny, Heavily Anti-Aliased Interior Cutouts
+- **Symptom**: Very small interior loops in typography or tight gaps between thin lines fail to knock out because edge anti-aliasing prevents their cores from dipping below the strict $t_{\text{bg}} = 6.5$ threshold.
+- **Remedy**: Apply `--cutout-box 400,500,800,900`.
+- **Result**: Core acceptance is relaxed inside the bounding box ($\Delta E \le t_{\text{bg}} + 5.0$, $\text{area} \ge 3$ px), cleanly opening the tight negative space.
+
+### Case C: Deep Interior Shadow Punch-Through
+- **Symptom**: A dark painted shadow or artistic fold in the interior of a foreground subject becomes translucent.
+- **Remedy**: Apply `--protect-box 400,500,800,900`.
+- **Result**: Forces definite foreground ($\text{trimap} = 1.0$) within the box, guaranteeing 100% solid opacity ($\alpha = 1.0$).
+
+### Case D: Broken Outline / Open Silhouette Gap Leakage
+- **Symptom**: Exterior background leaks through narrow gaps between foreground branches, tiers, or broken frame lines into the interior.
+- **Remedy**: Apply `--seal-box 400,500,800,900:20`.
+- **Result**: Bridges narrow outline gaps via morphological closing during flood-fill, preserving outer silhouette matting while preventing exterior background from flooding the interior.
+
+### Case E: Non-Rectangular Solid Interior Protection
+- **Symptom**: A triangular, arched, or polygonal interior motif requires 100% solid opacity without boxing out surrounding exterior background.
+- **Remedy**: Apply `--protect-poly 400,500,450,420,500,500`.
+- **Result**: Forces definite foreground ($\text{trimap} = 1.0$) strictly within the polygon vertices.

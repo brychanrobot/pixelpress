@@ -2,956 +2,2646 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "numpy",
-#     "pillow",
-#     "scipy",
-#     "scikit-learn",
+#     "numpy>=2.0",
+#     "pillow>=10.0",
+#     "scipy>=1.13",
+#     "opencv-python-headless>=4.10",
+#     "pymatting>=1.1.14",
+#     "scikit-learn>=1.5",
+#     "resvg-py>=0.2",
 # ]
 # ///
 
 """
-knockout_quantize.py - Knockout Background Removal & Discrete Screen-Print Color Quantization
+knockout_quantize.py - Spot-Color Ray Unmixing & Cutout Spline VTracer SVG + Decoupled Prepress Knockout
 
-A universal, mathematically rigorous CLI tool to unmix flat-color, screen-printed,
-and vector-style raster artwork from any continuous background (black, charcoal,
-purple, red, navy, green, white, etc.) into transparent PNGs with exact discrete
-palette colors and smooth, halo-free anti-aliased alpha.
+Universal, mathematically rigorous prepress CLI tool for background removal, spot-color unmixing, and vectorization.
+Decomposes illustration artwork into production-grade vector Cutout SVGs or transparent PNGs:
+- Vector Mode (default): Real-ESRGAN (2x) + continuous background field B(x,y)
+  + strict spot-color ray unmixing + 7x7 local core support constraint (scipy.ndimage.maximum_filter)
+  + strictly flat (K+1)-palette quantization + VTracer cutout splines + background path stripping
+  + exact canonical hex snapping (<= K spot inks) + clean scalable SVG + resvg 300 DPI RGBA render.
+- Raster Modes (dtg / dtf / screenprint): Edge-preserving chroma smoothing + continuous B(x,y) field
+  + topological trimap + closed-form Laplacian matting + known-B color-line projection
+  + decoupled post-processing (continuous DTG, firm alpha floor DTF, or spot-color silkscreen quantization).
+- Prepress 2x2 verification sheet and 1:1 native-resolution diagnostic inspection crops.
 """
 
 import argparse
+import fcntl
+import hashlib
+import io
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Dict, List, Optional, Tuple, Any
 
-import numpy as np
-from PIL import Image
-from scipy.ndimage import (
-    distance_transform_edt,
-    binary_erosion,
-    binary_dilation,
-    sobel,
-    maximum_filter,
-    label,
-    find_objects,
-    uniform_filter,
-    grey_dilation,
-    median_filter,
+EXPECTED_REALESRGAN_BIN_SHA256 = os.environ.get(
+    "PIXELPRESS_ESRGAN_BIN_SHA256",
+    "22c2296a39b40cc43ac92615c827ab6d4b60b7142e8cee59f718e3f8e2cdbda9",
 )
+
+import cv2
+import numpy as np
+import pymatting
+import resvg_py
+import scipy.ndimage
+from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import maximum_filter
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 
-def hex_to_rgb(hex_str: str) -> List[int]:
-    hex_clean = hex_str.strip().lstrip("#")
-    if len(hex_clean) == 3:
-        hex_clean = "".join(c * 2 for c in hex_clean)
-    if len(hex_clean) != 6:
-        raise ValueError(f"Invalid hex color string: {hex_str}")
-    return [int(hex_clean[i : i + 2], 16) for i in (0, 2, 4)]
+
+def get_system_font(size: int = 16) -> ImageFont.ImageFont:
+    """Finds a crisp clean system truetype font with fallback to default."""
+    candidates = [
+        "/usr/share/fonts/google-droid-sans-fonts/DroidSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/google-droid-sans-fonts/DroidSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
 
 
-def rgb_to_hex(rgb: Any) -> str:
-    r, g, b = [int(np.clip(np.round(c), 0, 255)) for c in rgb[:3]]
+def hex_to_rgb_float(hex_str: str) -> np.ndarray:
+    """Converts hex color string to float64 RGB in [0, 1]."""
+    clean = hex_str.strip().lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(c * 2 for c in clean)
+    if len(clean) != 6:
+        raise ValueError(f"Invalid hex color: {hex_str}")
+    return np.array([int(clean[i : i + 2], 16) for i in (0, 2, 4)], dtype=np.float64) / 255.0
+
+
+def rgb_to_hex(rgb_float: np.ndarray) -> str:
+    """Converts float64 RGB in [0, 1] to uppercase hex string."""
+    r, g, b = (np.clip(rgb_float[:3], 0.0, 1.0) * 255.0).round().astype(int)
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def hex_to_rgb_255(hex_str: str) -> np.ndarray:
+    """Converts hex color string to float32 RGB in [0, 255]."""
+    clean = hex_str.strip().lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(c * 2 for c in clean)
+    if len(clean) != 6:
+        raise ValueError(f"Invalid hex color: {hex_str}")
+    try:
+        return np.array([int(clean[i : i + 2], 16) for i in (0, 2, 4)], dtype=np.float32)
+    except ValueError as e:
+        raise ValueError(f"Invalid hex color: {hex_str}") from e
+
+
+def normalize_hex(hex_str: str) -> str:
+    """Normalizes hex color string to uppercase #RRGGBB."""
+    clean = hex_str.strip().lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(c * 2 for c in clean)
+    if len(clean) != 6:
+        raise ValueError(f"Invalid hex color: {hex_str}")
+    try:
+        _ = int(clean, 16)
+    except ValueError as e:
+        raise ValueError(f"Invalid hex color: {hex_str}") from e
+    return f"#{clean.upper()}"
+
+
+
+def parse_box(box_str: str) -> Tuple[int, int, int, int]:
+    """Parses 'x0,y0,x1,y1' string into integer coordinates."""
+    parts = [int(p.strip()) for p in box_str.replace(" ", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid bounding box '{box_str}', expected 'x0,y0,x1,y1'")
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def parse_seal_box(seal_str: str) -> Tuple[int, int, int, int, int]:
+    """Parses 'x0,y0,x1,y1[:radius]' string into integer coordinates and closing radius."""
+    if ":" in seal_str:
+        coords_str, radius_str = seal_str.split(":", 1)
+        radius = int(radius_str.strip())
+    else:
+        coords_str = seal_str
+        radius = 20
+    parts = [int(p.strip()) for p in coords_str.replace(" ", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid seal box '{seal_str}', expected 'x0,y0,x1,y1[:radius]'")
+    return parts[0], parts[1], parts[2], parts[3], radius
+
+
+def parse_poly(poly_str: str) -> np.ndarray:
+    """Parses 'x1,y1,x2,y2,x3,y3,...' string into an (N, 1, 2) integer vertex array."""
+    parts = [int(p.strip()) for p in poly_str.replace(" ", ",").split(",") if p.strip()]
+    if len(parts) < 6 or len(parts) % 2 != 0:
+        raise ValueError(f"Invalid polygon '{poly_str}', expected at least 3 vertex pairs 'x1,y1,x2,y2,x3,y3,...'")
+    return np.array(parts, dtype=np.int32).reshape((-1, 1, 2))
+
+
+def parse_crop_spec(crop_str: str) -> Tuple[int, int, int, int, str]:
+    """Parses 'x,y,w,h:label' or 'x0,y0,x1,y1:label' string."""
+    if ":" in crop_str:
+        coords_str, label = crop_str.split(":", 1)
+        label = label.strip()
+    else:
+        coords_str, label = crop_str, "Manual Inspection Crop"
+
+    parts = [int(p.strip()) for p in coords_str.replace(" ", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid crop coords '{coords_str}', expected 'x,y,w,h' or 'x0,y0,x1,y1'")
+
+    # If 3rd/4th parameters look like width/height (w < 800 and h < 800 and x1 > x0)
+    # Check if x1 > x0: if x1 <= x0, likely w, h
+    x0, y0, p2, p3 = parts
+    if p2 > x0 and p3 > y0:
+        # Specified as x0, y0, x1, y1
+        x1, y1 = p2, p3
+    else:
+        # Specified as x0, y0, width, height
+        x1, y1 = x0 + p2, y0 + p3
+
+    return x0, y0, x1, y1, label
+
+
+def clamp_box(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> Tuple[int, int, int, int]:
+    """Clamps bounding box within image boundaries."""
+    x0_c = max(0, min(w, x0))
+    x1_c = max(0, min(w, x1))
+    y0_c = max(0, min(h, y0))
+    y1_c = max(0, min(h, y1))
+    if x0_c > x1_c:
+        x0_c, x1_c = x1_c, x0_c
+    if y0_c > y1_c:
+        y0_c, y1_c = y1_c, y0_c
+    return x0_c, y0_c, x1_c, y1_c
+
+
+# =============================================================================
+# STAGE 1: Edge-Preserving CIELAB Chroma Smoothing
+# =============================================================================
+
+def apply_chroma_smoothing(
+    img_rgb: np.ndarray,
+    sigma_color: float = 12.0,
+    sigma_space: float = 5.0,
+) -> np.ndarray:
+    """
+    Applies bilateral filter strictly on CIELAB chroma channels (a*, b*).
+    L* is untouched (0% modification) to keep 1px edges and fine linework razor-sharp
+    while gently smoothing DCT/AI chroma blockiness and noise.
+    """
+    img_f32 = img_rgb.astype(np.float32)
+    lab = cv2.cvtColor(img_f32, cv2.COLOR_RGB2LAB)
+    L, a, b = cv2.split(lab)
+
+    a_smooth = cv2.bilateralFilter(a, d=7, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    b_smooth = cv2.bilateralFilter(b, d=7, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+
+    lab_smooth = cv2.merge([L, a_smooth, b_smooth])
+    rgb_smooth = cv2.cvtColor(lab_smooth, cv2.COLOR_LAB2RGB).astype(np.float64)
+    return np.clip(rgb_smooth, 0.0, 1.0)
+
+
+# =============================================================================
+# STAGE 2: Spatially Varying Background Field B(x, y)
+# =============================================================================
+
+def fit_robust_poly(A: np.ndarray, vals: np.ndarray, max_iter: int = 5) -> np.ndarray:
+    """Iteratively Reweighted Least Squares (IRLS) polynomial fit with Huber loss."""
+    weights = np.ones_like(vals)
+    c = np.zeros(A.shape[1], dtype=np.float64)
+    for _ in range(max_iter):
+        Aw = A * np.sqrt(weights[:, None])
+        vw = vals * np.sqrt(weights)
+        c, _, _, _ = np.linalg.lstsq(Aw, vw, rcond=None)
+        residuals = np.abs(A @ c - vals)
+        med_res = np.median(residuals)
+        k = 1.345 * (med_res * 1.4826 if med_res > 1e-6 else 1.0) + 1e-6
+        weights = np.where(residuals <= k, 1.0, k / (residuals + 1e-6))
+    return c
+
+
 def fit_background_field(
-    arr: np.ndarray,
-    margin_pct: float = 0.03,
-    manual_bg: Optional[List[int]] = None,
+    arr_rgb: np.ndarray,
+    border_pct: float = 0.025,
+    manual_bg_rgb: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
-    Fits a continuous 2D spatial background field B(y, x) using outer margins.
+    Fits a continuous 2D degree-2 polynomial background field B(x, y) from image borders.
     Returns:
-        B_field: (H, W, 3) float32 background color at each pixel.
-        mean_B: (3,) float32 average background color.
-        sigma: float estimated residual noise floor.
-        tau_low: float recommended knockout threshold.
+        B_field: (H, W, 3) continuous background color field.
+        mean_B: (3,) mean background RGB.
+        sigma_bg: residual noise floor std dev (in [0, 1]).
+        p99_border_dE: 99th percentile CIELAB delta_E on inlier border pixels.
     """
-    H, W, _ = arr.shape
-    if manual_bg is not None:
-        bg_val = np.array(manual_bg, dtype=np.float32)
-        B_field = np.tile(bg_val[None, None, :], (H, W, 1))
-        return B_field, bg_val, 2.0, 8.0
+    H, W, _ = arr_rgb.shape
+    if manual_bg_rgb is not None:
+        B_field = np.tile(manual_bg_rgb[None, None, :], (H, W, 1))
+        mean_B = manual_bg_rgb.copy()
+        return B_field, mean_B, 2.0 / 255.0, 6.0
 
-    margin = max(4, int(min(H, W) * margin_pct))
+    border_w = max(4, int(min(H, W) * border_pct))
     border_mask = np.zeros((H, W), dtype=bool)
-    border_mask[:margin, :] = True
-    border_mask[-margin:, :] = True
-    border_mask[:, :margin] = True
-    border_mask[:, -margin:] = True
+    border_mask[:border_w, :] = True
+    border_mask[-border_w:, :] = True
+    border_mask[:, :border_w] = True
+    border_mask[:, -border_w:] = True
 
-    ys, xs = np.where(border_mask)
-    rgb_v = arr[border_mask]
+    yy, xx = np.mgrid[0:H, 0:W]
+    xs_all = xx[border_mask] / float(W)
+    ys_all = yy[border_mask] / float(H)
+    pixels_all = arr_rgb[border_mask]
 
-    # Robust mode/histogram-peak background estimation on borders
-    # (prevents foreground artwork touching border from corrupting background)
-    rgb_quant = (np.clip(rgb_v, 0, 255) // 4).astype(np.int32)
-    packed = rgb_quant[:, 0] * 4096 + rgb_quant[:, 1] * 64 + rgb_quant[:, 2]
-    unique_bins, bin_counts = np.unique(packed, return_counts=True)
-    mode_bin = unique_bins[np.argmax(bin_counts)]
-    rough_bg_median = np.median(rgb_v[packed == mode_bin], axis=0)
+    # Convert border pixels to CIELAB to reject foreground border intrusions via MAD
+    pixels_f32 = pixels_all.astype(np.float32)
+    lab_border = cv2.cvtColor(pixels_f32.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    med_lab = np.median(lab_border, axis=0)
+    dev_lab = np.sqrt(np.sum((lab_border - med_lab) ** 2, axis=-1))
 
-    # Inlier border pixels within 25.0 RGB units of rough_bg_median
-    dev = np.linalg.norm(rgb_v - rough_bg_median, axis=-1)
-    inliers = dev <= 25.0
-    if np.sum(inliers) >= 30:
-        inlier_pixels = rgb_v[inliers]
-        inlier_dev = np.linalg.norm(inlier_pixels - rough_bg_median, axis=-1)
-        inlier_std = float(np.median(inlier_dev) * 1.4826)
-    else:
-        inlier_std = 2.0
+    med_dev = np.median(dev_lab)
+    mad = np.median(np.abs(dev_lab - med_dev))
+    mad_sigma = mad * 1.4826
+    cutoff = float(np.clip(med_dev + 3.0 * mad_sigma + 4.0, 10.0, 32.0))
+    inliers = dev_lab <= cutoff
 
-    # Strict cutoff: never exceeds 24.0 so low-contrast foreground (dist >= 35) is never absorbed
-    cutoff = float(np.clip(inlier_std * 3.5 + 10.0, 14.0, 24.0))
-    valid_border = dev <= cutoff
+    if np.sum(inliers) < 50:
+        inliers = np.ones(len(pixels_all), dtype=bool)
 
-    ys_v, xs_v = ys[valid_border], xs[valid_border]
-    rgb_valid = rgb_v[valid_border]
+    xs = xs_all[inliers]
+    ys = ys_all[inliers]
+    pixels_inliers = pixels_all[inliers]
 
-    # Least squares fit of affine 2D plane: B(y, x) = c0 + c1*(y/H) + c2*(x/W)
-    A = np.column_stack([np.ones_like(ys_v), ys_v / H, xs_v / W])
-    C_coeffs, _, _, _ = np.linalg.lstsq(A, rgb_valid, rcond=None)
+    # Degree-2 2D polynomial: 1, x, y, x^2, x*y, y^2
+    A = np.column_stack([np.ones_like(xs), xs, ys, xs**2, xs * ys, ys**2])
+    coeffs = [fit_robust_poly(A, pixels_inliers[:, c]) for c in range(3)]
 
-    grid_y, grid_x = np.indices((H, W), dtype=np.float32)
-    A_full = np.stack([np.ones_like(grid_y), grid_y / H, grid_x / W], axis=-1)
-    B_field = A_full @ C_coeffs
+    X_full = xx / float(W)
+    Y_full = yy / float(H)
+    A_full = np.stack(
+        [np.ones_like(X_full), X_full, Y_full, X_full**2, X_full * Y_full, Y_full**2],
+        axis=-1,
+    )
+
+    B_field = np.zeros((H, W, 3), dtype=np.float64)
+    for c in range(3):
+        B_field[:, :, c] = np.sum(A_full * coeffs[c], axis=-1)
+    B_field = np.clip(B_field, 0.0, 1.0)
     mean_B = np.mean(B_field, axis=(0, 1))
 
-    # Compute residual noise floor
-    fitted_border = A @ C_coeffs
-    residuals = np.linalg.norm(rgb_valid - fitted_border, axis=-1)
-    sigma = float(np.median(residuals) * 1.4826)
-    tau_low = float(np.clip(max(6.0, 3.5 * sigma), 6.0, 16.0))
+    # Noise residual statistics on inliers
+    border_res = np.abs(pixels_inliers - B_field[border_mask][inliers])
+    sigma_bg = float(np.median(border_res) * 1.4826)
 
-    return B_field, mean_B, sigma, tau_low
+    # Compute border CIELAB delta_E
+    inlier_B = B_field[border_mask][inliers].astype(np.float32)
+    lab_inlier_B = cv2.cvtColor(inlier_B.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    border_dE = np.sqrt(np.sum((lab_border[inliers] - lab_inlier_B) ** 2, axis=-1))
+    p99_border_dE = float(np.percentile(border_dE, 99))
+
+    return B_field, mean_B, sigma_bg, p99_border_dE
+
+
+def compute_lab_delta_e(img_rgb: np.ndarray, bg_rgb: np.ndarray) -> np.ndarray:
+    """Computes perceptual Euclidean CIELAB delta_E between two RGB images."""
+    lab_I = cv2.cvtColor(img_rgb.astype(np.float32), cv2.COLOR_RGB2LAB)
+    lab_B = cv2.cvtColor(bg_rgb.astype(np.float32), cv2.COLOR_RGB2LAB)
+    return np.sqrt(np.sum((lab_I - lab_B) ** 2, axis=-1))
+
+
+# =============================================================================
+# STAGE 3: Topological Two-Threshold Trimap with Interior Protection
+# =============================================================================
+
+def build_topological_trimap(
+    img_proc: np.ndarray,
+    B_field: np.ndarray,
+    delta_E: np.ndarray,
+    delta_E_raw: Optional[np.ndarray] = None,
+    t_bg: float = 6.5,
+    t_fg: float = 40.0,
+    t_thin: float = 32.0,
+    unknown_band_px: float = 6.0,
+    min_cutout_area: int = 6,
+    protect_interior_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    cutout_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    seal_boxes: Optional[List[Tuple[int, int, int, int, int]]] = None,
+    protect_polys: Optional[List[np.ndarray]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Constructs a topological trimap (0.0: definite bg, 0.5: unknown, 1.0: definite fg).
+    Employs true bg_core interior protection, thin-stroke ridge preservation without Gibbs ringing,
+    and declarative ROI overrides.
+    Returns:
+        trimap: (H, W) float64 array with values in {0.0, 0.5, 1.0}.
+        true_bg_regions: (H, W) boolean mask of verified exterior and interior background.
+        valid_cutout_mask: (H, W) boolean mask of interior cutouts.
+        thin_ridges: (H, W) boolean mask of preserved 1-2px high-contrast ridges.
+        dist_from_bg: (H, W) float32 distance transform array from true background.
+        valid_cutout_count: number of accepted interior cutout holes.
+    """
+    H, W = delta_E.shape
+    if delta_E_raw is None:
+        delta_E_raw = delta_E
+    dE_min = np.minimum(delta_E, delta_E_raw)
+    protect_interior_boxes = protect_interior_boxes or []
+    protect_boxes = protect_boxes or []
+    cutout_boxes = cutout_boxes or []
+    seal_boxes = seal_boxes or []
+    protect_polys = protect_polys or []
+
+    # 1. Candidate background seed
+    cutout_pocket_mask = np.zeros((H, W), dtype=bool)
+    for cb in cutout_boxes:
+        cx0, cy0, cx1, cy1 = clamp_box(*cb, W, H)
+        dE_b = delta_E[cy0:cy1, cx0:cx1]
+        dE_raw_b = delta_E_raw[cy0:cy1, cx0:cx1]
+        box_seed = (
+            ((dE_b <= max(t_bg + 18.0, 26.0)) | (dE_raw_b <= max(t_bg + 20.0, 28.0)))
+            & (dE_raw_b <= 38.0)
+        )
+        cutout_pocket_mask[cy0:cy1, cx0:cx1] |= box_seed
+
+    bg_seed = (dE_min <= (t_bg + 3.0)) | cutout_pocket_mask
+
+    # Topological outline gap sealing (--seal-box)
+    barrier = ~bg_seed
+    barrier_sealed = barrier.copy()
+    for sb in seal_boxes:
+        sx0, sy0, sx1, sy1, r = sb
+        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+        px0, py0 = max(0, sx0 - r), max(0, sy0 - r)
+        px1, py1 = min(W, sx1 + r), min(H, sy1 + r)
+        roi = barrier[py0:py1, px0:px1].astype(np.uint8)
+        k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        closed_roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k_seal)
+        ox0, oy0 = sx0 - px0, sy0 - py0
+        ox1, oy1 = ox0 + (sx1 - sx0), oy0 + (sy1 - sy0)
+        barrier_sealed[sy0:sy1, sx0:sx1] |= (closed_roi[oy0:oy1, ox0:ox1] > 0)
+
+    # 2. 8-connected components labeling
+    candidate_bg = ~barrier_sealed
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        candidate_bg.astype(np.uint8), connectivity=8
+    )
+
+    # Identify exterior background components (touching canvas perimeter)
+    border_pixels = np.concatenate(
+        [labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]
+    )
+    border_label_ids = set(np.unique(border_pixels))
+    border_label_ids.discard(0)
+
+    exterior_bg = np.isin(labels, list(border_label_ids))
+
+    # Evaluate genuine interior cutouts/counters
+    valid_cutout_mask = np.zeros((H, W), dtype=bool)
+    valid_cutout_count = 0
+
+    for lbl in range(1, num_labels):
+        if lbl in border_label_ids:
+            continue
+
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        cx, cy = centroids[lbl]
+
+        # Check if component centroid falls within any --cutout-box ROI or overlaps it
+        in_cutout_roi = any(
+            cb[0] <= cx < cb[2] and cb[1] <= cy < cb[3] for cb in cutout_boxes
+        )
+        if not in_cutout_roi and cutout_boxes:
+            c_left = stats[lbl, cv2.CC_STAT_LEFT]
+            c_top = stats[lbl, cv2.CC_STAT_TOP]
+            c_w = stats[lbl, cv2.CC_STAT_WIDTH]
+            c_h = stats[lbl, cv2.CC_STAT_HEIGHT]
+            c_right = c_left + c_w
+            c_bottom = c_top + c_h
+            for cb in cutout_boxes:
+                if not (c_right <= cb[0] or c_left >= cb[2] or c_bottom <= cb[1] or c_top >= cb[3]):
+                    if np.any(labels[max(c_top, cb[1]):min(c_bottom, cb[3]), max(c_left, cb[0]):min(c_right, cb[2])] == lbl):
+                        in_cutout_roi = True
+                        break
+
+        area_thresh = 3 if in_cutout_roi else min_cutout_area
+        de_thresh = max(t_bg + 18.0, 26.0) if in_cutout_roi else t_bg
+
+        if area >= area_thresh:
+            comp_idx = labels == lbl
+            p25_dE = np.percentile(delta_E[comp_idx], 25)
+            min_dE = np.min(delta_E[comp_idx])
+            min_dE_raw = np.min(delta_E_raw[comp_idx])
+            if (p25_dE <= de_thresh) or (in_cutout_roi and (min_dE <= de_thresh or min_dE_raw <= max(t_bg + 20.0, 28.0))):
+                valid_cutout_mask[comp_idx] = True
+                valid_cutout_count += 1
+
+    # Suppress interior cutout mask inside any --seal-box ROI
+    for sb in seal_boxes:
+        sx0, sy0, sx1, sy1, _ = sb
+        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+        valid_cutout_mask[sy0:sy1, sx0:sx1] = False
+
+    # Seed validated cutout pockets from explicit --cutout-box
+    if np.any(cutout_pocket_mask):
+        valid_cutout_mask |= cutout_pocket_mask
+        num_cutouts, _ = cv2.connectedComponents(valid_cutout_mask.astype(np.uint8))
+        valid_cutout_count = max(valid_cutout_count, num_cutouts - 1)
+
+    # Combine exterior bg and validated interior cutouts
+    true_bg_regions = exterior_bg | valid_cutout_mask
+
+    # Apply --protect-interior-box overrides:
+    # Suppresses interior cutout holes inside box while preserving outer silhouette matting!
+    for pib in protect_interior_boxes:
+        x0, y0, x1, y1 = clamp_box(*pib, W, H)
+        true_bg_regions[y0:y1, x0:x1] = (
+            (true_bg_regions[y0:y1, x0:x1] & exterior_bg[y0:y1, x0:x1])
+            | cutout_pocket_mask[y0:y1, x0:x1]
+        )
+
+    # Euclidean distance from verified background
+    dist_from_bg = cv2.distanceTransform(
+        (~true_bg_regions).astype(np.uint8), cv2.DIST_L2, 5
+    )
+
+    # Build Trimap:
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    local_max_dE = cv2.dilate(delta_E.astype(np.float32), k11)
+
+    # 1. Definite Background (0.0): eroded true_bg_regions + tiny exterior bg islands
+    sure_bg = cv2.erode(true_bg_regions.astype(np.uint8), k3, iterations=1).astype(bool)
+
+    # Ensure every valid cutout component has at least one pixel anchored in sure_bg
+    for lbl in range(1, num_labels):
+        comp_idx = (labels == lbl) & valid_cutout_mask
+        if np.any(comp_idx) and not np.any(sure_bg & comp_idx):
+            comp_dE = np.where(comp_idx, delta_E, 1e9)
+            min_y, min_x = np.unravel_index(np.argmin(comp_dE), comp_dE.shape)
+            sure_bg[min_y, min_x] = True
+
+    # Tiny exterior background islands far from high-contrast foreground
+    fg_high = (
+        (delta_E >= t_fg)
+        & (delta_E >= 0.72 * local_max_dE)
+        & (~true_bg_regions)
+    ).astype(np.uint8)
+    dist_from_fg_high = cv2.distanceTransform((~fg_high).astype(np.uint8), cv2.DIST_L2, 5)
+    exterior_pure_bg = true_bg_regions & (delta_E <= t_bg * 0.85) & (dist_from_fg_high >= 2.0)
+    sure_bg |= exterior_pure_bg
+
+    # Seed sure_bg directly from cutout pockets
+    sure_bg |= cutout_pocket_mask
+
+    # 2. Definite Foreground (1.0):
+    # 2a. High-contrast eroded foreground with 7x7 elliptical kernel (radius 3px)
+    fg_eroded = cv2.erode(fg_high, k7, iterations=1).astype(bool)
+
+    # 2b. Deep topological interior via geodesically connected potential background
+    pot_bg_thresh = min(22.0, max(t_bg + 2.0, 0.55 * t_fg))
+    potential_bg_raw = (dE_min <= pot_bg_thresh) | true_bg_regions
+    num_pot, pot_labels = cv2.connectedComponents(
+        potential_bg_raw.astype(np.uint8), connectivity=8
+    )
+    overlapping_labels = np.unique(pot_labels[true_bg_regions])
+    overlapping_labels = overlapping_labels[overlapping_labels > 0]
+    connected_potential_bg = np.isin(pot_labels, overlapping_labels)
+
+    dist_from_potential_bg = cv2.distanceTransform(
+        (~connected_potential_bg).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    deep_interior = (dist_from_potential_bg > unknown_band_px) & (~true_bg_regions)
+
+    # 2c. Thin 1-2px stroke/filigree ridge preservation:
+    # Strict 1D directional peak on x or y:
+    dE_pad = np.pad(delta_E, 1, mode="edge")
+    is_peak_x = (
+        (delta_E >= dE_pad[1:-1, :-2])
+        & (delta_E >= dE_pad[1:-1, 2:])
+        & ((delta_E > dE_pad[1:-1, :-2]) | (delta_E > dE_pad[1:-1, 2:]))
+    )
+    is_peak_y = (
+        (delta_E >= dE_pad[:-2, 1:-1])
+        & (delta_E >= dE_pad[2:, 1:-1])
+        & ((delta_E > dE_pad[:-2, 1:-1]) | (delta_E > dE_pad[2:, 1:-1]))
+    )
+    max_dE = maximum_filter(delta_E, size=3)
+    is_ridge = (is_peak_x | is_peak_y) & (delta_E >= (max_dE - 1.0))
+
+    # Polarity-invariant local peak vector alignment:
+    lab_I = cv2.cvtColor(img_proc.astype(np.float32), cv2.COLOR_RGB2LAB)
+    lab_B = cv2.cvtColor(B_field.astype(np.float32), cv2.COLOR_RGB2LAB)
+    L_diff = np.abs(lab_I[:, :, 0] - lab_B[:, :, 0])
+    chroma_diff = np.sqrt(
+        (lab_I[:, :, 1] - lab_B[:, :, 1]) ** 2 + (lab_I[:, :, 2] - lab_B[:, :, 2]) ** 2
+    )
+
+    diff_IB = (img_proc - B_field).astype(np.float32)
+    w_fg = (np.maximum(delta_E - t_bg, 0.0) ** 2)[:, :, np.newaxis].astype(np.float32)
+    v_dom = cv2.GaussianBlur(w_fg * diff_IB, (9, 9), 2.5)
+    dot_dom = np.sum(diff_IB * v_dom, axis=-1)
+
+    valid_stroke_contrast = ((L_diff > 6.0) | (chroma_diff > 10.0)) & (dot_dom > 0.0)
+
+    thin_ridges = (
+        is_ridge
+        & (delta_E > t_thin)
+        & valid_stroke_contrast
+        & (~true_bg_regions)
+    )
+
+    border_aa_guard = (
+        (dist_from_bg <= max(2.5, 0.5 * unknown_band_px))
+        & (delta_E < 0.85 * local_max_dE)
+    )
+
+    sure_fg = (fg_eroded | deep_interior) & (~sure_bg) & (~border_aa_guard)
+
+    # Assemble trimap
+    trimap = np.full((H, W), 0.5, dtype=np.float64)
+    trimap[sure_bg] = 0.0
+    trimap[sure_fg] = 1.0
+
+    # Reachability-Bounded Interior Foreground Promotion:
+    # Any enclosed interior fill inside --protect-interior-box or --seal-box that is blocked
+    # from true background by fg_wall is promoted to 1.0 (Sure Foreground) while preserving outer anti-aliasing.
+    wall_thresh = min(16.0, max(t_bg + 4.0, 0.35 * t_fg))
+    fg_wall = ((delta_E >= wall_thresh) & (delta_E_raw > (t_bg + 2.5))).copy()
+
+    for sb in seal_boxes:
+        sx0, sy0, sx1, sy1, r = sb
+        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+        px0, py0 = max(0, sx0 - r), max(0, sy0 - r)
+        px1, py1 = min(W, sx1 + r), min(H, sy1 + r)
+        roi = fg_wall[py0:py1, px0:px1].astype(np.uint8)
+        k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        closed_roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k_seal)
+        ox0, oy0 = sx0 - px0, sy0 - py0
+        ox1, oy1 = ox0 + (sx1 - sx0), oy0 + (sy1 - sy0)
+        fg_wall[sy0:sy1, sx0:sx1] |= (closed_roi[oy0:oy1, ox0:ox1] > 0)
+
+    for poly in protect_polys:
+        poly_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [poly], 1)
+        fg_wall[poly_mask > 0] = True
+
+    open_or_bg = (~fg_wall) | true_bg_regions
+    num_open, open_labels = cv2.connectedComponents(
+        open_or_bg.astype(np.uint8), connectivity=8
+    )
+    bg_labels = np.unique(open_labels[true_bg_regions])
+    bg_labels = bg_labels[bg_labels > 0]
+    reachable_from_bg = np.isin(open_labels, bg_labels)
+
+    in_protected_or_sealed = np.zeros((H, W), dtype=bool)
+    for pib in protect_interior_boxes:
+        x0, y0, x1, y1 = clamp_box(*pib, W, H)
+        in_protected_or_sealed[y0:y1, x0:x1] = True
+    for sb in seal_boxes:
+        x0, y0, x1, y1, _ = sb
+        x0, y0, x1, y1 = clamp_box(x0, y0, x1, y1, W, H)
+        in_protected_or_sealed[y0:y1, x0:x1] = True
+
+    enclosed_interior_fg = (
+        (~reachable_from_bg)
+        & (~true_bg_regions)
+        & in_protected_or_sealed
+        & (dist_from_bg > max(2.5, 0.5 * unknown_band_px))
+        & (~border_aa_guard)
+    )
+    enclosed_interior_fg &= (~cutout_pocket_mask)
+
+    trimap[enclosed_interior_fg] = 1.0
+
+    # Thin stroke rescue: promote 0.0 -> 0.5 (never 1.0) so thin strokes unmix cleanly
+    thin_mask = thin_ridges
+    trimap[(thin_mask > 0) & (trimap == 0.0)] = 0.5
+
+    # Ensure anti-aliased border pixels near background stay unknown (0.5)
+    trimap[border_aa_guard & (trimap == 1.0)] = 0.5
+
+    # 3. Apply explicit --protect-box overrides: force trimap = 1.0
+    for pb in protect_boxes:
+        x0, y0, x1, y1 = clamp_box(*pb, W, H)
+        trimap[y0:y1, x0:x1] = 1.0
+        true_bg_regions[y0:y1, x0:x1] = False
+
+    # Apply explicit --protect-poly overrides: force trimap = 1.0
+    for poly in protect_polys:
+        poly_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [poly], 1)
+        in_poly = poly_mask > 0
+        trimap[in_poly] = 1.0
+        true_bg_regions[in_poly] = False
+
+    # 4. Explicit --cutout-box sure_bg seeding with anti-aliasing transition ring
+    if np.any(cutout_pocket_mask):
+        trimap[cutout_pocket_mask] = 0.0
+        sure_bg[cutout_pocket_mask] = True
+        true_bg_regions[cutout_pocket_mask] = True
+
+        dist_to_pocket = cv2.distanceTransform(
+            (~cutout_pocket_mask).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        transition_ring = (dist_to_pocket <= 2.0) & (~cutout_pocket_mask)
+        demote_mask = transition_ring & (trimap == 1.0)
+        trimap[demote_mask] = 0.5
+
+    return trimap, true_bg_regions, valid_cutout_mask, thin_ridges, dist_from_bg, valid_cutout_count
+
+
+# =============================================================================
+# STAGE 4: Closed-Form Laplacian Alpha Matting + Known-B Color-Line Unmixing
+# =============================================================================
+
+def run_pymatting_unmixing(
+    img_proc: np.ndarray,
+    trimap: np.ndarray,
+    B_field: np.ndarray,
+    delta_E: Optional[np.ndarray] = None,
+    t_bg: float = 6.5,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Executes Two-Stage PyMatting + Known-B vector color-line unmixing.
+    Returns:
+        F_final: (H, W, 3) decontaminated foreground colors in [0, 1].
+        alpha_final: (H, W) continuous alpha matte in [0, 1].
+        F_init: (H, W, 3) initial ML foreground estimate.
+        elapsed_sec: execution time in seconds.
+    """
+    t0 = time.perf_counter()
+
+    # Numerical boundary guards [NUM-01]
+    n_bg = np.sum(trimap == 0.0)
+    n_fg = np.sum(trimap == 1.0)
+    n_unk = np.sum(trimap == 0.5)
+
+    if n_fg == 0:
+        return np.zeros_like(img_proc), np.zeros(trimap.shape, dtype=np.float64), np.zeros_like(img_proc), 0.0
+    if n_bg == 0:
+        return img_proc.copy(), np.ones(trimap.shape, dtype=np.float64), img_proc.copy(), 0.0
+    if n_unk == 0:
+        alpha_final = trimap.copy()
+        F_final = img_proc.copy()
+        F_final[alpha_final == 0.0] = 0.0
+        return F_final, alpha_final, img_proc.copy(), 0.0
+
+    # Step 4a: Closed-form Laplacian alpha estimation
+    if verbose:
+        print("  [Stage 4a] Computing Closed-Form Laplacian alpha matte...")
+    alpha_cf = pymatting.estimate_alpha_cf(img_proc, trimap)
+
+    # Step 4b: Stage-1 continuous foreground color field
+    if verbose:
+        print("  [Stage 4b] Estimating initial foreground field F_init...")
+    F_init = pymatting.estimate_foreground_ml(img_proc, alpha_cf)
+    F_init = np.clip(F_init, 0.0, 1.0)
+
+    # Step 4c: Known-B vector color-line projection on Unknown band
+    if verbose:
+        print("  [Stage 4c] Computing Known-B vector color-line projection...")
+    unknown = trimap == 0.5
+    v_fb = F_init - B_field
+    v_ib = img_proc - B_field
+    dot_num = np.sum(v_ib * v_fb, axis=-1)
+    denom = np.sum(v_fb * v_fb, axis=-1) + 1e-4
+    alpha_proj = np.clip(dot_num / denom, 0.0, 1.0)
+
+    # F_init - B contrast norm
+    norm_fb = np.sqrt(np.maximum(denom - 1e-4, 0.0))
+
+    # [MEM-01] Immediately free projection intermediaries
+    del v_fb, v_ib, dot_num, denom
+
+    alpha_final = trimap.copy()
+    alpha_final[unknown] = alpha_cf[unknown]
+
+    # For unknown band where foreground-background contrast is distinct (||v_fb|| > 0.06):
+    # take minimum(alpha_cf, alpha_proj) to eliminate Gibbs ringing and bleeding
+    use_proj = unknown & (norm_fb > 0.06)
+    alpha_final[use_proj] = np.minimum(alpha_cf[use_proj], alpha_proj[use_proj])
+
+    # Soft-foot noise suppression on tiny background noise residuals [ALG-01]
+    if delta_E is not None:
+        feather_mask = unknown & (delta_E <= t_bg) & (alpha_final < 0.12)
+        if np.any(feather_mask):
+            t = alpha_final[feather_mask] / 0.12
+            alpha_final[feather_mask] = t * t * (3.0 - 2.0 * t) * alpha_final[feather_mask]
+            alpha_final = np.where(alpha_final < 0.01, 0.0, alpha_final)
+
+    # Step 4d: Clean alpha floor / ceiling
+    alpha_final[alpha_final < 0.02] = 0.0
+    alpha_final[alpha_final > 0.985] = 1.0
+    alpha_final[trimap == 0.0] = 0.0
+
+    # Prune tiny isolated low-opacity exterior noise specks (area <= 8, max_alpha < 0.55)
+    speck_mask = (alpha_final > 0.0).astype(np.uint8)
+    num_specks, speck_labels, speck_stats, _ = cv2.connectedComponentsWithStats(
+        speck_mask, connectivity=8
+    )
+    for s_idx in range(1, num_specks):
+        if speck_stats[s_idx, cv2.CC_STAT_AREA] <= 8:
+            s_pixels = speck_labels == s_idx
+            if np.max(alpha_final[s_pixels]) < 0.55:
+                alpha_final[s_pixels] = 0.0
+
+    # Step 4e: Stage-2 final foreground decontamination
+    if verbose:
+        print("  [Stage 4e] Performing Stage-2 foreground decontamination F_final...")
+    if np.max(alpha_final) == 0.0:
+        F_final = np.zeros_like(img_proc)
+    else:
+        F_final = pymatting.estimate_foreground_ml(img_proc, alpha_final)
+        F_final = np.clip(F_final, 0.0, 1.0)
+        # Zero out RGB where alpha is zero for optimal PNG compression
+        F_final[alpha_final == 0.0] = 0.0
+
+    elapsed_sec = time.perf_counter() - t0
+    return F_final, alpha_final, F_init, elapsed_sec
+
+
+# =============================================================================
+# STAGE 5: Strictly Decoupled Post-Processing
+# =============================================================================
+
+def postprocess_mode(
+    F_final: np.ndarray,
+    alpha_final: np.ndarray,
+    mode: str = "dtg",
+    dtf_alpha_floor: float = 0.15,
+    colors: int = 8,
+    explicit_palette: Optional[List[np.ndarray]] = None,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Optional[List[str]]]:
+    """
+    Applies decoupled printing technology post-processing:
+    - 'dtg': Continuous F_final and alpha_final (ZERO quantization).
+    - 'dtf': Continuous F_final with soft Hermite alpha floor ramp (< 15%).
+    - 'screenprint': Weighted K-means palette quantization + binary alpha (>= 0.5).
+    """
+    F_out = F_final.copy()
+    alpha_out = alpha_final.copy()
+    palette_hex_list: Optional[List[str]] = None
+
+    if mode == "dtg":
+        # Keep continuous unmixed output
+        pass
+
+    elif mode == "dtf":
+        # Firm alpha floor with soft Hermite ramp to prevent powdery adhesive scatter
+        floor = max(0.01, min(0.5, dtf_alpha_floor))
+        low_vapor = (alpha_out > 0.0) & (alpha_out < floor)
+        t = alpha_out[low_vapor] / floor
+        alpha_out[low_vapor] = t * t * (3.0 - 2.0 * t) * alpha_out[low_vapor]
+        alpha_out[alpha_out < 0.02] = 0.0
+        F_out[alpha_out == 0.0] = 0.0
+
+    elif mode == "screenprint":
+        if verbose:
+            print("  [Stage 5] Running decoupled spot-color quantization for screen printing...")
+
+        fg_mask = alpha_out >= 0.5
+        if np.sum(fg_mask) == 0:
+            return np.zeros_like(F_out), np.zeros_like(alpha_out), []
+        solid_mask = alpha_out >= 0.8
+        if np.sum(solid_mask) < colors * 20:
+            solid_mask = fg_mask
+
+        solid_pixels = F_out[solid_mask]
+
+        if explicit_palette is not None and len(explicit_palette) > 0:
+            palette_rgb = np.array(explicit_palette, dtype=np.float64)
+        else:
+            n_clust = min(colors, len(solid_pixels), max(1, len(solid_pixels) // 50))
+            km = KMeans(n_clusters=n_clust, random_state=42, n_init=10).fit(solid_pixels)
+            # Refine cluster centers to median RGB of inliers
+            palette_list = []
+            for k in range(n_clust):
+                k_pix = solid_pixels[km.labels_ == k]
+                if len(k_pix) > 0:
+                    palette_list.append(np.median(k_pix, axis=0))
+                else:
+                    palette_list.append(km.cluster_centers_[k])
+            palette_rgb = np.array(palette_list, dtype=np.float64)
+
+        # Snap foreground pixels (alpha >= 0.5) to nearest palette color in CIELAB
+        fg_pixels = F_out[fg_mask].astype(np.float32)
+        lab_fg = cv2.cvtColor(fg_pixels.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+        lab_pal = cv2.cvtColor(palette_rgb.astype(np.float32).reshape(-1, 1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+
+        # Pairwise distance (N_fg, K)
+        dists = np.sqrt(np.sum((lab_fg[:, None, :] - lab_pal[None, :, :]) ** 2, axis=-1))
+        best_pal_idx = np.argmin(dists, axis=-1)
+
+        F_out[fg_mask] = palette_rgb[best_pal_idx]
+
+        # Screenprint binary/halftone-ready alpha
+        alpha_out = np.where(fg_mask, 1.0, 0.0)
+        F_out[alpha_out == 0.0] = 0.0
+
+        palette_hex_list = [rgb_to_hex(c) for c in palette_rgb]
+
+    return F_out, alpha_out, palette_hex_list
+
+
+# =============================================================================
+# VECTOR CUTOUT PREPRESS WORKFLOW (Real-ESRGAN + Edge-Snap + VTracer)
+# =============================================================================
+
+def resolve_realesrgan_bin(verbose: bool = False) -> str:
+    """
+    Auto-resolves path to realesrgan-ncnn-vulkan executable:
+    1. System PATH
+    2. ~/.cache/pixelpress/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan
+    3. Auto-downloads and extracts official v0.2.5.0 Linux binary release to cache dir.
+    """
+    bin_in_path = shutil.which("realesrgan-ncnn-vulkan")
+    if bin_in_path and os.path.isfile(bin_in_path) and os.access(bin_in_path, os.X_OK):
+        return bin_in_path
+
+    cache_parent = os.path.expanduser("~/.cache/pixelpress")
+    cache_dir = os.path.join(cache_parent, "realesrgan-ncnn-vulkan")
+    lock_path = os.path.join(cache_parent, "realesrgan.lock")
+
+    os.makedirs(cache_parent, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            cached_bin = os.path.join(cache_dir, "realesrgan-ncnn-vulkan")
+            cached_models = os.path.join(cache_dir, "models")
+            if (
+                os.path.isfile(cached_bin)
+                and os.access(cached_bin, os.X_OK)
+                and os.path.isdir(cached_models)
+            ):
+                return cached_bin
+
+            if verbose:
+                print(f"realesrgan-ncnn-vulkan binary not found. Downloading official v0.2.5.0 Linux release to {cache_dir}...")
+
+            zip_url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
+            with tempfile.TemporaryDirectory(dir=cache_parent) as tmp_extract_dir:
+                zip_path = os.path.join(tmp_extract_dir, "realesrgan.zip")
+                urllib.request.urlretrieve(zip_url, zip_path)
+
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    extract_root = os.path.abspath(tmp_extract_dir)
+                    for member in zip_ref.infolist():
+                        member_path = os.path.abspath(os.path.join(tmp_extract_dir, member.filename))
+                        if not member_path.startswith(extract_root + os.sep) and member_path != extract_root:
+                            raise RuntimeError(f"Zip-Slip vulnerability detected in member: {member.filename}")
+                        zip_ref.extract(member, tmp_extract_dir)
+
+                extracted_bin = os.path.join(tmp_extract_dir, "realesrgan-ncnn-vulkan")
+                extracted_models = os.path.join(tmp_extract_dir, "models")
+
+                if not (os.path.isfile(extracted_bin) and os.path.isdir(extracted_models)):
+                    raise RuntimeError(
+                        f"Expected realesrgan-ncnn-vulkan and models/ in extracted archive, but they were missing in {tmp_extract_dir}"
+                    )
+
+                h = hashlib.sha256()
+                with open(extracted_bin, "rb") as f:
+                    while chunk := f.read(65536):
+                        h.update(chunk)
+                computed_sha256 = h.hexdigest().lower()
+                if computed_sha256 != EXPECTED_REALESRGAN_BIN_SHA256.lower():
+                    raise RuntimeError(
+                        f"SHA-256 checksum mismatch for realesrgan-ncnn-vulkan: expected {EXPECTED_REALESRGAN_BIN_SHA256}, got {computed_sha256}"
+                    )
+
+                os.chmod(extracted_bin, 0o755)
+
+                staging_dir = os.path.join(tmp_extract_dir, "staged")
+                os.makedirs(staging_dir, exist_ok=True)
+                shutil.move(extracted_bin, os.path.join(staging_dir, "realesrgan-ncnn-vulkan"))
+                shutil.move(extracted_models, os.path.join(staging_dir, "models"))
+
+                if os.path.exists(cache_dir):
+                    shutil.rmtree(cache_dir)
+                shutil.move(staging_dir, cache_dir)
+
+            if os.path.isfile(cached_bin) and os.access(cached_bin, os.X_OK) and os.path.isdir(cached_models):
+                return cached_bin
+
+            raise FileNotFoundError(
+                f"Unable to resolve or auto-download realesrgan-ncnn-vulkan binary into {cache_dir}"
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def resolve_vtracer_bin(custom_path: Optional[str] = None) -> str:
+    """
+    Auto-resolves path to vtracer executable:
+    1. Explicit custom_path if provided
+    2. System PATH
+    3. ~/.cargo/bin/vtracer
+    """
+    if custom_path:
+        expanded = os.path.expanduser(custom_path)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+        raise FileNotFoundError(f"Specified vtracer binary not found or not executable: {custom_path}")
+
+    bin_in_path = shutil.which("vtracer")
+    if bin_in_path and os.path.isfile(bin_in_path) and os.access(bin_in_path, os.X_OK):
+        return bin_in_path
+
+    cargo_bin = os.path.expanduser("~/.cargo/bin/vtracer")
+    if os.path.isfile(cargo_bin) and os.access(cargo_bin, os.X_OK):
+        return cargo_bin
+
+    raise FileNotFoundError(
+        "vtracer binary not found on PATH or ~/.cargo/bin/vtracer. Please install via 'cargo install vtracer'."
+    )
+
+
+def run_esrgan_upscale_2x(
+    pil_in: Image.Image,
+    model_name: str,
+    target_w: int,
+    target_h: int,
+    verbose: bool = False,
+) -> Image.Image:
+    """
+    Upscales/denoises an image to (target_w, target_h) = (2*W, 2*H) using Real-ESRGAN Vulkan.
+    - realesrgan-x4plus-anime: runs with -s 4, then downsamples 0.5x Lanczos to 2x.
+    - realesr-animevideov3: runs with -s 2 directly to 2x.
+    - none: performs Lanczos 2x upscale directly.
+    """
+    if model_name == "none":
+        if verbose:
+            print(f"Skipping Real-ESRGAN (model='none'). Performing 2x Lanczos upscale to {target_w}x{target_h}...")
+        return pil_in.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    try:
+        bin_path = resolve_realesrgan_bin(verbose=verbose)
+        candidate_models = os.path.join(os.path.dirname(os.path.realpath(bin_path)), "models")
+        fallback_models = os.path.expanduser("~/.cache/pixelpress/realesrgan-ncnn-vulkan/models")
+        if os.path.isdir(candidate_models):
+            models_dir = candidate_models
+        elif os.path.isdir(fallback_models):
+            models_dir = fallback_models
+        else:
+            models_dir = candidate_models
+
+        with tempfile.TemporaryDirectory() as td:
+            temp_in = os.path.join(td, "esrgan_input.png")
+            temp_out = os.path.join(td, "esrgan_output.png")
+            pil_in.save(temp_in)
+
+            if model_name == "realesrgan-x4plus-anime":
+                cmd = [
+                    bin_path,
+                    "-i", temp_in,
+                    "-o", temp_out,
+                    "-n", "realesrgan-x4plus-anime",
+                    "-s", "4",
+                    "-m", models_dir,
+                ]
+                if verbose:
+                    print(f"Executing Real-ESRGAN: {' '.join(cmd)}")
+                t0 = time.perf_counter()
+                subprocess.run(cmd, check=True, timeout=120, capture_output=True, text=True)
+                if verbose:
+                    print(f"Real-ESRGAN 4x inference finished in {time.perf_counter() - t0:.2f}s. Downscaling 0.5x Lanczos to {target_w}x{target_h}...")
+                img_4x = Image.open(temp_out).convert("RGB")
+                img_2x = img_4x.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                return img_2x
+
+            elif model_name == "realesr-animevideov3":
+                cmd = [
+                    bin_path,
+                    "-i", temp_in,
+                    "-o", temp_out,
+                    "-n", "realesr-animevideov3",
+                    "-s", "2",
+                    "-m", models_dir,
+                ]
+                if verbose:
+                    print(f"Executing Real-ESRGAN: {' '.join(cmd)}")
+                t0 = time.perf_counter()
+                subprocess.run(cmd, check=True, timeout=120, capture_output=True, text=True)
+                if verbose:
+                    print(f"Real-ESRGAN 2x inference finished in {time.perf_counter() - t0:.2f}s...")
+                img_2x = Image.open(temp_out).convert("RGB")
+                if img_2x.size != (target_w, target_h):
+                    img_2x = img_2x.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                return img_2x
+            else:
+                raise ValueError(f"Unknown esrgan_model: {model_name}")
+
+    except Exception as exc:
+        err_msg = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            err_msg = f"{exc}: {exc.stderr.strip()}"
+        sys.stderr.write(
+            f"Warning: Real-ESRGAN upscale failed ({err_msg}). Falling back gracefully to 2x Lanczos.\n"
+        )
+        return pil_in.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+
+SVG_CMD_RE = re.compile(r"([MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)")
+SVG_TRANSLATE_RE = re.compile(
+    r"translate\(\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)(?:[\s,]+([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?))?\s*\)"
+)
+
+
+def parse_svg_path_vertices(d_str: str, tx: float = 0.0, ty: float = 0.0) -> Tuple[List[float], List[float]]:
+    """
+    Tokenizes SVG command letters (MmLlHhVvCcSsQqTtAaZz) and numbers supporting scientific notation,
+    tracks current pen (cx, cy) and subpath start (sx, sy), handles implicit repeated command tuples cleanly
+    (including H/h 1-arg, V/v 1-arg, C/c 6-arg, S/s 4-arg, Q/q 4-arg, T/t 2-arg, A/a 7-arg where indices 5,6
+    are target x,y), and returns absolute canvas (xs, ys) coordinates.
+    """
+    tokens = SVG_CMD_RE.findall(d_str)
+    if not tokens:
+        return [], []
+
+    xs: List[float] = []
+    ys: List[float] = []
+
+    cx, cy = 0.0, 0.0
+    sx, sy = 0.0, 0.0
+
+    i = 0
+    n = len(tokens)
+    cmd = ""
+
+    def is_cmd(tok: str) -> bool:
+        return len(tok) == 1 and tok in "MmLlHhVvCcSsQqTtAaZz"
+
+    while i < n:
+        tok = tokens[i]
+        if is_cmd(tok):
+            cmd = tok
+            i += 1
+        elif not cmd:
+            i += 1
+            continue
+
+        if cmd in ("Z", "z"):
+            cx, cy = sx, sy
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("M", "m"):
+            if i + 1 >= n or is_cmd(tokens[i]) or is_cmd(tokens[i + 1]):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i]), float(tokens[i + 1])
+            i += 2
+            if cmd == "M":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            sx, sy = cx, cy
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            cmd = "L" if cmd == "M" else "l"
+            continue
+
+        if cmd in ("L", "l"):
+            if i + 1 >= n or is_cmd(tokens[i]) or is_cmd(tokens[i + 1]):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i]), float(tokens[i + 1])
+            i += 2
+            if cmd == "L":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("H", "h"):
+            if i >= n or is_cmd(tokens[i]):
+                i += 1
+                continue
+            x_val = float(tokens[i])
+            i += 1
+            if cmd == "H":
+                cx = x_val
+            else:
+                cx += x_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("V", "v"):
+            if i >= n or is_cmd(tokens[i]):
+                i += 1
+                continue
+            y_val = float(tokens[i])
+            i += 1
+            if cmd == "V":
+                cy = y_val
+            else:
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("C", "c"):
+            if i + 5 >= n or any(is_cmd(tokens[i + k]) for k in range(6)):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i + 4]), float(tokens[i + 5])
+            i += 6
+            if cmd == "C":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("S", "s"):
+            if i + 3 >= n or any(is_cmd(tokens[i + k]) for k in range(4)):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i + 2]), float(tokens[i + 3])
+            i += 4
+            if cmd == "S":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("Q", "q"):
+            if i + 3 >= n or any(is_cmd(tokens[i + k]) for k in range(4)):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i + 2]), float(tokens[i + 3])
+            i += 4
+            if cmd == "Q":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("T", "t"):
+            if i + 1 >= n or is_cmd(tokens[i]) or is_cmd(tokens[i + 1]):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i]), float(tokens[i + 1])
+            i += 2
+            if cmd == "T":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        if cmd in ("A", "a"):
+            if i + 6 >= n or any(is_cmd(tokens[i + k]) for k in range(7)):
+                i += 1
+                continue
+            x_val, y_val = float(tokens[i + 5]), float(tokens[i + 6])
+            i += 7
+            if cmd == "A":
+                cx = x_val
+                cy = y_val
+            else:
+                cx += x_val
+                cy += y_val
+            xs.append(cx + tx)
+            ys.append(cy + ty)
+            continue
+
+        i += 1
+
+    return xs, ys
+
+
+def clean_vtracer_svg(
+    raw_svg_path: str,
+    out_svg_path: str,
+    w_orig: int,
+    h_orig: int,
+    w_2x: int,
+    h_2x: int,
+    bg_rgb: np.ndarray,
+    ink_rgbs: List[np.ndarray],
+    canonical_hexes: List[str],
+    protect_interior_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    cutout_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_polys_2x: Optional[List[np.ndarray]] = None,
+    verbose: bool = False,
+) -> int:
+    """
+    Cleans VTracer SVG output:
+    1. Sets native print dimensions width="{w_orig}", height="{h_orig}", and viewBox="0 0 {w_2x} {h_2x}".
+    2. Strips every <rect> and <path> whose fill RGB is closer to background B than to any foreground ink C_k
+       (unless explicitly protected within protect_boxes_2x or protect_interior_boxes_2x).
+    3. Snaps every remaining foreground <path> fill attribute to the exact canonical uppercase hex of its
+       nearest spot ink C_k, guaranteeing at most K unique spot-color hexes in the SVG (zero color fragmentation!).
+    Returns total count of removed true interior negative-space cutout elements.
+    """
+    with open(raw_svg_path, "r", encoding="utf-8") as f:
+        svg_text = f.read()
+
+    if re.search(r"<!\s*(?:doctype|entity)\b", svg_text, re.IGNORECASE):
+        raise ValueError("Potentially malicious SVG: DTD / Entity declarations are forbidden.")
+
+    try:
+        ET.register_namespace("", "http://www.w3.org/2000/svg")
+        root = ET.fromstring(svg_text)
+        tree = ET.ElementTree(root)
+    except ET.ParseError as pe:
+        raise ValueError(f"Failed to parse SVG XML from {raw_svg_path}: {pe}") from pe
+
+    root.attrib["width"] = str(w_orig)
+    root.attrib["height"] = str(h_orig)
+    root.attrib["viewBox"] = f"0 0 {w_2x} {h_2x}"
+
+    protect_boxes = (protect_interior_boxes_2x or []) + (protect_boxes_2x or [])
+    cutout_boxes = cutout_boxes_2x or []
+    protect_polygons = protect_polys_2x or []
+
+    exterior_removed = 0
+    interior_cutouts_removed = 0
+
+    def get_fill_hex(elem: ET.Element) -> Optional[str]:
+        fill = elem.attrib.get("fill", "")
+        if not fill and "style" in elem.attrib:
+            for part in elem.attrib["style"].split(";"):
+                if part.strip().startswith("fill:"):
+                    fill = part.strip().split(":")[1].strip()
+                    break
+        if fill and fill.startswith("#"):
+            return fill
+        return None
+
+    def snap_elem_fill(elem: ET.Element, ink_idx: int) -> None:
+        target_hex = canonical_hexes[ink_idx]
+        elem.attrib["fill"] = target_hex
+        if "style" in elem.attrib:
+            parts = [p.strip() for p in elem.attrib["style"].split(";") if p.strip()]
+            new_parts = [p for p in parts if not p.startswith("fill:")]
+            if new_parts:
+                elem.attrib["style"] = ";".join(new_parts)
+            else:
+                del elem.attrib["style"]
+
+    for parent in root.iter():
+        to_remove = []
+        for child in list(parent):
+            tag = child.tag.split("}")[-1]
+            if tag not in ("path", "rect", "polygon"):
+                continue
+
+            fill_str = get_fill_hex(child)
+
+            if tag == "rect":
+                w_attr = child.attrib.get("width", "")
+                h_attr = child.attrib.get("height", "")
+                is_full_canvas = (
+                    ("%" in w_attr or str(w_2x) in w_attr or str(w_orig) in w_attr)
+                    and ("%" in h_attr or str(h_2x) in h_attr or str(h_orig) in h_attr)
+                )
+                if is_full_canvas:
+                    to_remove.append(child)
+                    exterior_removed += 1
+                    continue
+                if fill_str:
+                    c = hex_to_rgb_255(fill_str)
+                    dist_b = float(np.linalg.norm(c - bg_rgb))
+                    min_ink_dist = min([float(np.linalg.norm(c - ink_rgb)) for ink_rgb in ink_rgbs])
+                    if dist_b < min_ink_dist:
+                        to_remove.append(child)
+                        exterior_removed += 1
+                        continue
+                    else:
+                        best_k = int(np.argmin([float(np.linalg.norm(c - ink_rgb)) for ink_rgb in ink_rgbs]))
+                        snap_elem_fill(child, best_k)
+                        continue
+
+            if tag in ("path", "polygon"):
+                if not fill_str:
+                    continue
+
+                c = hex_to_rgb_255(fill_str)
+                dist_b = float(np.linalg.norm(c - bg_rgb))
+                ink_dists = [float(np.linalg.norm(c - ink_rgb)) for ink_rgb in ink_rgbs]
+                min_ink_dist = min(ink_dists)
+
+                if dist_b < min_ink_dist:
+                    # Background path or polygon!
+                    transform = child.attrib.get("transform", "")
+                    tx, ty = 0.0, 0.0
+                    if transform:
+                        m = SVG_TRANSLATE_RE.search(transform)
+                        if m:
+                            tx = float(m.group(1))
+                            ty = float(m.group(2)) if m.group(2) is not None else 0.0
+
+                    if tag == "polygon":
+                        points_str = child.attrib.get("points", "")
+                        nums = [float(v) for v in re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", points_str)]
+                        xs = [nums[k] + tx for k in range(0, len(nums) - 1, 2)]
+                        ys = [nums[k + 1] + ty for k in range(0, len(nums) - 1, 2)]
+                    else:
+                        d_str = child.attrib.get("d", "")
+                        xs, ys = parse_svg_path_vertices(d_str, tx=tx, ty=ty)
+
+                    if not xs or not ys:
+                        to_remove.append(child)
+                        exterior_removed += 1
+                        continue
+
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
+                    center_x = (min_x + max_x) / 2.0
+                    center_y = (min_y + max_y) / 2.0
+
+                    touches_border = (
+                        min_x <= 1.5 or min_y <= 1.5 or max_x >= (w_2x - 1.5) or max_y >= (h_2x - 1.5)
+                    )
+
+                    if touches_border:
+                        to_remove.append(child)
+                        exterior_removed += 1
+                        continue
+
+                    # Interior background path (cutout)
+                    test_points = [(center_x, center_y)]
+                    stride = max(1, len(xs) // 16)
+                    for k_idx in range(0, len(xs), stride):
+                        test_points.append((xs[k_idx], ys[k_idx]))
+
+                    in_protect = False
+                    for px, py in test_points:
+                        if any(px0 <= px <= px1 and py0 <= py <= py1 for (px0, py0, px1, py1) in protect_boxes):
+                            in_protect = True
+                            break
+                        if protect_polygons:
+                            pt = (float(px), float(py))
+                            if any(cv2.pointPolygonTest(poly, pt, False) >= 0 for poly in protect_polygons):
+                                in_protect = True
+                                break
+
+                    in_cutout = False
+                    for px, py in test_points:
+                        if any(cx0 <= px <= cx1 and cy0 <= py <= cy1 for (cx0, cy0, cx1, cy1) in cutout_boxes):
+                            in_cutout = True
+                            break
+
+                    if in_protect and not in_cutout:
+                        best_k = int(np.argmin(ink_dists))
+                        snap_elem_fill(child, best_k)
+                        continue
+                    else:
+                        to_remove.append(child)
+                        interior_cutouts_removed += 1
+                        continue
+                else:
+                    # Closer to foreground ink: snap to nearest canonical ink hex!
+                    best_k = int(np.argmin(ink_dists))
+                    snap_elem_fill(child, best_k)
+
+        for child in to_remove:
+            parent.remove(child)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_svg_path)), exist_ok=True)
+    tree.write(out_svg_path, encoding="utf-8", xml_declaration=True)
+    if verbose:
+        print(
+            f"Cleaned Cutout SVG saved to {out_svg_path} "
+            f"(removed {exterior_removed} exterior, {interior_cutouts_removed} interior cutouts, "
+            f"snapped fills to {len(canonical_hexes)} spot inks: {', '.join(canonical_hexes)})"
+        )
+
+    return interior_cutouts_removed
 
 
 def discover_palette(
-    arr: np.ndarray,
-    B_field: np.ndarray,
-    mean_B: np.ndarray,
-    n_colors: int,
-    sigma: float,
-    scale_factor: float = 1.0,
-    explicit_palette: Optional[List[List[int]]] = None,
-    min_cluster_ratio: float = 0.0008,
-) -> np.ndarray:
-    """
-    Discovers discrete ink colors by clustering pure interior core pixels.
-    Snaps each cluster to the exact physical median RGB of its core pixels.
-    Auto-prunes extraneous noise clusters with < 0.08% of core pixels (ALG-04).
-    """
-    if explicit_palette is not None:
-        return np.array(explicit_palette, dtype=np.float32)
-
-    H, W, _ = arr.shape
-    diff = arr - B_field
-    dist = np.linalg.norm(diff, axis=-1)
-
-    tau_solid = max(38.0, 6.0 * sigma)
-    solid_mask = dist > tau_solid
-    erode_iter = max(1, int(np.round(2 * scale_factor)))
-    eroded_solid = binary_erosion(solid_mask, iterations=erode_iter)
-
-    grad_y = sobel(arr, axis=0) / 8.0
-    grad_x = sobel(arr, axis=1) / 8.0
-    grad_mag = np.sqrt(np.sum(grad_y**2 + grad_x**2, axis=-1))
-
-    pure_core_mask = eroded_solid & (grad_mag < 20.0)
-    core_pixels = arr[pure_core_mask]
-
-    if len(core_pixels) < n_colors * 10:
-        # Fallback to broader foreground if artwork has very thin lines
-        cand_mask = (dist > 25.0) & (grad_mag < 30.0)
-        core_pixels = arr[cand_mask]
-        if len(core_pixels) < n_colors:
-            core_pixels = arr[dist > max(15.0, 3.0 * sigma)]
-
-    km = KMeans(n_clusters=n_colors, random_state=42, n_init=10).fit(core_pixels)
-    labels = km.labels_
-    counts = np.bincount(labels, minlength=n_colors)
-    total_core = len(core_pixels)
-
-    # Auto-prune tiny clusters (< min_cluster_ratio of core pixels, e.g. < 0.08%)
-    min_pixels = max(30, int(total_core * min_cluster_ratio))
-    valid_clusters = [k for k in range(n_colors) if counts[k] >= min_pixels]
-    if len(valid_clusters) == 0:
-        valid_clusters = list(range(n_colors))
-
-    palette_list = []
-    for k in valid_clusters:
-        k_mask = labels == k
-        palette_list.append(np.median(core_pixels[k_mask], axis=0))
-
-    palette = np.array(palette_list, dtype=np.float32)
-
-    # Sort palette by Euclidean distance from mean background
-    dist_bg = np.linalg.norm(palette - mean_B, axis=-1)
-    sort_idx = np.argsort(dist_bg)
-    palette = palette[sort_idx]
-
-    return palette
-
-
-def find_collinear_pairs(
-    palette: np.ndarray,
-    mean_B: np.ndarray,
-    cos_threshold: float = 0.88,
-    ratio_threshold: float = 0.85,
-    max_perp_dist: float = 85.0,
-) -> List[Tuple[int, int, float, float, float]]:
-    """
-    Detects pairs of inks (m, k) where ink m is an anti-aliased intermediate rim along the ray to ink k.
-    Requires:
-      1. High cosine similarity (cos > cos_threshold)
-      2. Intermediate length (ratio < ratio_threshold)
-      3. Small perpendicular distance from palette[m] to the line segment (mean_B -> palette[k])
-      4. Positive luminance shift relative to background (anti-aliasing rims of bright inks)
-    """
-    K = len(palette)
-    vecs = palette - mean_B
-    norms = np.linalg.norm(vecs, axis=-1)
-    delta_Y = 0.299 * vecs[:, 0] + 0.587 * vecs[:, 1] + 0.114 * vecs[:, 2]
-
-    collinear_pairs = []
-    for i in range(K):
-        for j in range(K):
-            if i != j:
-                # Both inks must be brighter than background (rims of bright foreground against darker BG)
-                if delta_Y[i] <= 0 or delta_Y[j] <= 0:
-                    continue
-                dot = np.dot(vecs[i], vecs[j])
-                cos = dot / max(norms[i] * norms[j], 1e-4)
-                if cos > cos_threshold and norms[i] < ratio_threshold * norms[j]:
-                    # Perpendicular distance from palette[i] to the ray (mean_B -> palette[j])
-                    proj = dot / max(norms[j], 1e-4)
-                    perp_sq = max(0.0, norms[i]**2 - proj**2)
-                    perp_dist = float(np.sqrt(perp_sq))
-                    if perp_dist <= max_perp_dist:
-                        collinear_pairs.append((i, j, float(cos), float(norms[i]), float(norms[j])))
-    return collinear_pairs
-
-
-def assign_and_unmix(
-    arr: np.ndarray,
-    B_field: np.ndarray,
-    mean_B: np.ndarray,
-    palette: np.ndarray,
-    mode: str = "screenprint",
-    tau_low: float = 6.0,
-    tau_solid: Optional[float] = None,
-    alpha_solid: float = 0.85,
-    alpha_knee: float = 0.18,
-    alpha_power: float = 1.0,
-    despeckle_size: int = 20,
-    collinear_threshold: float = 0.75,
-    collinear_ratio: float = 0.88,
+    img_rgb: np.ndarray,
+    bg_rgb: np.ndarray,
+    inks: Optional[int] = 0,
+    merge_hue_tol: float = 12.0,
     verbose: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> Tuple[List[np.ndarray], List[str]]:
     """
-    Solid-Core Voronoi Propagation + Pure-Ink Ray Alpha Unmixing:
-    1. Solid Core Seeding: Exact Euclidean nearest-color matching against (palette + background)
-       with collinear intermediate ink suppression on high-gradient boundary slopes.
-    2. Isolated Sub-Pixel Component Seeding: Assigns whole tiny components (stars, snowflakes)
-       to the best-matching palette ray direction without color fracturing.
-    3. Voronoi Core Propagation: Boundary anti-aliased edge pixels inherit identity from nearest solid core.
-    4. Exact Ray-Projected Alpha: Contrast-proportional noise gate eliminates JPEG mosquito ringing
-       while preserving low-contrast dark strokes.
-    5. Pure-Ink Boundary Color: 100% pure uncontaminated palette ink on all boundaries (zero fringe!).
+    Auto-discovers foreground spot-color inks:
+    1. Samples high-opacity interior foreground pixels (dist_to_bg >= 40.0 AND 2px erosion)
+       to avoid anti-aliased boundary mixtures α C + (1-α) B or thin background fringes.
+    2. Clusters colors in CIELAB space. If inks > 0, fits K=inks clusters.
+       Otherwise, evaluates K in 2..6 and selects K maximizing silhouette score.
+    3. Refines cluster centers to median RGB of inliers.
+    4. Merges/consolidates hues within merge_hue_tol in CIELAB and discards background-bleed hues.
     """
-    H, W, _ = arr.shape
-    scale_factor = float(min(H, W)) / 764.0
-    diff = arr - B_field
-    fg_dist = np.linalg.norm(diff, axis=-1)
+    P = img_rgb.astype(np.float32)
+    B = bg_rgb.astype(np.float32)
+    dist_to_bg = np.linalg.norm(P - B.reshape(1, 1, 3), axis=2)
 
-    # Noise-stabilized image for interior classification
-    arr_smoothed = median_filter(arr, size=(3, 3, 1))
+    fg_candidate = (dist_to_bg >= 40.0).astype(np.uint8)
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_interior = cv2.erode(fg_candidate, k_erode, iterations=1) > 0
 
-    K = len(palette)
-    vecs = palette - mean_B
-    norms = np.linalg.norm(vecs, axis=-1)
+    if np.sum(fg_interior) < 500:
+        fg_interior = dist_to_bg >= 25.0
+    if np.sum(fg_interior) < 100:
+        fg_interior = dist_to_bg >= 15.0
 
-    # Compute luminance shift of each ink relative to background
-    # (used for polarity separation to prevent dark foliage from being hijacked by bright snow caps)
-    delta_Y_ink = 0.299 * vecs[:, 0] + 0.587 * vecs[:, 1] + 0.114 * vecs[:, 2]
-    dark_inks = [k for k in range(K) if delta_Y_ink[k] < -10.0]
-    bright_inks = [k for k in range(K) if delta_Y_ink[k] >= -10.0]
-    has_dual_polarity = (len(dark_inks) > 0 and len(bright_inks) > 0)
+    sample_rgb = P[fg_interior]
+    if len(sample_rgb) < 2:
+        if len(sample_rgb) == 1:
+            fallback = [np.mean(sample_rgb, axis=0).astype(np.float32)]
+        else:
+            fallback = [np.array([255.0, 255.0, 255.0], dtype=np.float32)]
+        fallback_hexes = [f"#{int(round(c[0])):02X}{int(round(c[1])):02X}{int(round(c[2])):02X}" for c in fallback]
+        return fallback, fallback_hexes
 
-    # Pixel luminance difference from local background
-    delta_Y_pixel = 0.299 * diff[:, :, 0] + 0.587 * diff[:, :, 1] + 0.114 * diff[:, :, 2]
-    is_dark_pixel = delta_Y_pixel < -6.0
+    sample_lab = cv2.cvtColor((sample_rgb / 255.0).reshape(-1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB).reshape(-1, 3)
 
-    collinear_pairs = find_collinear_pairs(
-        palette, mean_B, cos_threshold=collinear_threshold, ratio_threshold=collinear_ratio
+    if len(sample_lab) > 10000:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(sample_lab), size=10000, replace=False)
+        fit_lab = sample_lab[idx]
+        fit_rgb = sample_rgb[idx]
+    else:
+        fit_lab = sample_lab
+        fit_rgb = sample_rgb
+
+    if inks is not None and inks >= 1:
+        if inks == 1:
+            best_k = 1
+            med_rgb = np.median(sample_rgb, axis=0)
+            cluster_rgbs = [np.clip(med_rgb, 0.0, 255.0).astype(np.float32)]
+        else:
+            best_k = min(inks, len(fit_lab))
+            km = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit(fit_lab)
+            cluster_rgbs = []
+            for k in range(best_k):
+                mask = km.labels_ == k
+                if np.sum(mask) > 0:
+                    med_rgb = np.median(fit_rgb[mask], axis=0)
+                else:
+                    med_lab = km.cluster_centers_[k:k+1].reshape(1, 1, 3).astype(np.float32)
+                    med_rgb = cv2.cvtColor(med_lab, cv2.COLOR_LAB2RGB).reshape(3) * 255.0
+                cluster_rgbs.append(np.clip(med_rgb, 0.0, 255.0).astype(np.float32))
+    else:
+        max_k = min(6, max(2, len(fit_lab) // 50))
+        best_score = -2.0
+        best_k = 2
+        best_km = None
+        sil_sample_size = min(2000, len(fit_lab))
+        for k_cand in range(2, max_k + 1):
+            km_cand = KMeans(n_clusters=k_cand, random_state=42, n_init=10).fit(fit_lab)
+            try:
+                score = float(silhouette_score(fit_lab, km_cand.labels_, sample_size=sil_sample_size, random_state=42))
+            except Exception:
+                score = -1.0
+            if verbose:
+                print(f"    Auto-palette search K={k_cand}: silhouette={score:.4f}")
+            if score > best_score:
+                best_score = score
+                best_k = k_cand
+                best_km = km_cand
+        km = best_km if best_km is not None else KMeans(n_clusters=2, random_state=42, n_init=10).fit(fit_lab)
+        cluster_rgbs = []
+        for k in range(best_k):
+            mask = km.labels_ == k
+            if np.sum(mask) > 0:
+                med_rgb = np.median(fit_rgb[mask], axis=0)
+            else:
+                med_lab = km.cluster_centers_[k:k+1].reshape(1, 1, 3).astype(np.float32)
+                med_rgb = cv2.cvtColor(med_lab, cv2.COLOR_LAB2RGB).reshape(3) * 255.0
+            cluster_rgbs.append(np.clip(med_rgb, 0.0, 255.0).astype(np.float32))
+
+    lab_B = cv2.cvtColor((B / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
+    surviving_rgbs = []
+    for c_rgb in cluster_rgbs:
+        c_lab = cv2.cvtColor((c_rgb / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
+        dE_bg = float(np.linalg.norm(c_lab - lab_B))
+        if dE_bg >= merge_hue_tol:
+            surviving_rgbs.append(c_rgb)
+
+    if not surviving_rgbs:
+        surviving_rgbs = cluster_rgbs
+
+    consolidated = []
+    for c_rgb in surviving_rgbs:
+        c_lab = cv2.cvtColor((c_rgb / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
+        merged = False
+        for j, exist_rgb in enumerate(consolidated):
+            exist_lab = cv2.cvtColor((exist_rgb / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
+            if float(np.linalg.norm(c_lab - exist_lab)) < merge_hue_tol:
+                consolidated[j] = 0.5 * (exist_rgb + c_rgb)
+                merged = True
+                break
+        if not merged:
+            consolidated.append(c_rgb)
+
+    ink_rgbs = [np.clip(c, 0.0, 255.0).astype(np.float32) for c in consolidated]
+    canonical_hexes = [f"#{int(round(c[0])):02X}{int(round(c[1])):02X}{int(round(c[2])):02X}" for c in ink_rgbs]
+    if verbose:
+        print(f"Discovered {len(ink_rgbs)} spot inks: {', '.join(canonical_hexes)}")
+    return ink_rgbs, canonical_hexes
+
+
+def unmix_spot_colors(
+    P: np.ndarray,
+    B: np.ndarray,
+    ink_rgbs: List[np.ndarray],
+    protect_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    cutout_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_polys_2x: Optional[List[np.ndarray]] = None,
+    seal_boxes: Optional[List[Tuple[int, int, int, int, int]]] = None,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Strict Spot-Color Ray Unmixing + Interior Solid CIELAB Guard + 7x7 Local Core Support:
+    1. Projects P - B onto each ink ray C_k - B for boundary anti-aliased mixture pixels.
+    2. Computes foreground core distance (EDT on CIELAB delta_E > 18.0 & alpha > 0.75).
+    3. Deep interior pixels (> 3px inside foreground) evaluate direct solid CIELAB distance (alpha = 1.0)
+       to each palette ink C_k, preventing interior highlights/gradients from matching fractional background rays.
+    4. Enforces 7x7 local core support constraint via scipy.ndimage.maximum_filter.
+    5. Builds the strictly flat (K+1)-color RGB raster for VTracer spline vectorization.
+    """
+    K = len(ink_rgbs)
+    H, W, _ = P.shape
+
+    C_minus_B = []
+    norm_sq = []
+    for Ck in ink_rgbs:
+        diff = Ck - B
+        C_minus_B.append(diff)
+        norm_sq.append(float(np.dot(diff, diff) + 1e-6))
+
+    P_minus_B = P - B.reshape(1, 1, 3)
+    dist_to_bg = np.linalg.norm(P_minus_B, axis=2)
+
+    alphas = []
+    residuals = []
+    dots = []
+    for k in range(K):
+        diff = C_minus_B[k].reshape(1, 1, 3)
+        dot = np.sum(P_minus_B * diff, axis=2)
+        dots.append(dot)
+        a_k = np.clip(dot / norm_sq[k], 0.0, 1.0)
+        P_hat = B.reshape(1, 1, 3) + a_k[:, :, None] * diff
+        res = np.linalg.norm(P - P_hat, axis=2)
+        alphas.append(a_k)
+        residuals.append(res)
+
+    alphas = np.stack(alphas, axis=2)
+    residuals = np.stack(residuals, axis=2)
+    dots = np.stack(dots, axis=2)
+    raw_scores = residuals / (alphas + 0.15)
+
+    # Convert P and B to CIELAB for perceptual color distance metrics
+    P_norm = np.clip(P / 255.0, 0.0, 1.0).astype(np.float32)
+    P_lab = cv2.cvtColor(P_norm, cv2.COLOR_RGB2LAB)
+    B_norm = np.clip(B / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
+    B_lab = cv2.cvtColor(B_norm, cv2.COLOR_RGB2LAB)[0, 0]
+    dE_to_bg = np.linalg.norm(P_lab - B_lab.reshape(1, 1, 3), axis=2)
+
+    # Compute foreground core distance via Euclidean Distance Transform (EDT)
+    # on initial foreground pixels far from bg_rgb (CIELAB delta_E > 18.0 and raw ray alpha > 0.75)
+    max_alpha = np.max(alphas, axis=2)
+    initial_fg = (dE_to_bg > 18.0) & (max_alpha > 0.75)
+    for pbox in (protect_boxes_2x or []):
+        px0, py0, px1, py1 = clamp_box(*pbox, W, H)
+        initial_fg[py0:py1, px0:px1] = True
+    for poly in (protect_polys_2x or []):
+        poly_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [poly], 1)
+        initial_fg[poly_mask > 0] = True
+    for cbox in (cutout_boxes_2x or []):
+        cx0, cy0, cx1, cy1 = clamp_box(*cbox, W, H)
+        initial_fg[cy0:cy1, cx0:cx1] = False
+    for sb in (seal_boxes or []):
+        sx0, sy0, sx1, sy1, r = sb
+        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+        px0, py0 = max(0, sx0 - r), max(0, sy0 - r)
+        px1, py1 = min(W, sx1 + r), min(H, sy1 + r)
+        roi = initial_fg[py0:py1, px0:px1].astype(np.uint8)
+        k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        closed_roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k_seal)
+        ox0, oy0 = sx0 - px0, sy0 - py0
+        ox1, oy1 = ox0 + (sx1 - sx0), oy0 + (sy1 - sy0)
+        initial_fg[sy0:sy1, sx0:sx1] |= (closed_roi[oy0:oy1, ox0:ox1] > 0)
+
+    edt_inside_fg = scipy.ndimage.distance_transform_edt(initial_fg)
+    deep_interior = edt_inside_fg > 3.0
+
+    # For deep interior pixels (> 3px away from background/transition), evaluate direct
+    # solid CIELAB distance (alpha = 1.0) to each palette ink C_k instead of fractional
+    # background-blended ray projection, preventing interior gradients/highlights from
+    # erroneously matching background-blended rays of a wrong third ink.
+    if np.any(deep_interior):
+        dE_solid = np.zeros((H, W, K), dtype=np.float32)
+        for k in range(K):
+            Ck_norm = np.clip(ink_rgbs[k] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
+            Ck_lab = cv2.cvtColor(Ck_norm, cv2.COLOR_RGB2LAB)[0, 0]
+            dE_solid[:, :, k] = np.linalg.norm(P_lab - Ck_lab.reshape(1, 1, 3), axis=2)
+
+        raw_scores[deep_interior] = dE_solid[deep_interior]
+        alphas[deep_interior] = 1.0
+        dots[deep_interior] = np.maximum(dots[deep_interior], 1.0)
+        if verbose:
+            print(f"    Interior Solid CIELAB Guard: {int(np.sum(deep_interior))} solid interior pixels evaluated directly")
+
+    # Local Core Support Constraint:
+    # 1. Determine unconstrained interior winner
+    k_raw = np.argmin(raw_scores, axis=2)
+    best_raw_alpha = np.take_along_axis(alphas, k_raw[:, :, None], axis=2).squeeze(2)
+
+    # 2. Define true core presence of ink k
+    is_core = np.zeros((H, W, K), dtype=bool)
+    for k in range(K):
+        is_core[:, :, k] = (k_raw == k) & (best_raw_alpha >= 0.70) & ((dist_to_bg >= 28.0) | deep_interior)
+
+    # 3. Dilate is_core by 7x7 window (radius = 3px at 2x ESRGAN resolution)
+    supported_mask = np.zeros((H, W, K), dtype=bool)
+    for k in range(K):
+        supported_mask[:, :, k] = scipy.ndimage.maximum_filter(is_core[:, :, k], size=7)
+
+    any_supported = np.any(supported_mask, axis=2)
+
+    # 4. For boundary/anti-aliased pixels with at least one supported ink, penalize unsupported inks
+    scores = raw_scores.copy()
+    mask_to_penalize = (~deep_interior[:, :, None]) & any_supported[:, :, None] & (~supported_mask)
+    scores[mask_to_penalize] = 1e6
+
+    # 5. Pick winning ink
+    k_star = np.argmin(scores, axis=2)
+    best_alpha = np.take_along_axis(alphas, k_star[:, :, None], axis=2).squeeze(2)
+    best_dot = np.take_along_axis(dots, k_star[:, :, None], axis=2).squeeze(2)
+
+    # 6. Continuous alpha ramp, tightened against Gibbs ringing
+    clean_alpha = np.clip((best_alpha - 0.25) / (0.80 - 0.25), 0.0, 1.0)
+    clean_alpha[dist_to_bg < 22.0] = 0.0
+    clean_alpha[best_dot <= 0] = 0.0
+    clean_alpha[deep_interior] = 1.0
+
+    # Apply ROI overrides
+    for pbox in (protect_boxes_2x or []):
+        px0, py0, px1, py1 = clamp_box(*pbox, W, H)
+        clean_alpha[py0:py1, px0:px1] = 1.0
+
+    for poly in (protect_polys_2x or []):
+        poly_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [poly], 1)
+        clean_alpha[poly_mask > 0] = 1.0
+
+    for cbox in (cutout_boxes_2x or []):
+        cx0, cy0, cx1, cy1 = clamp_box(*cbox, W, H)
+        box_d = dist_to_bg[cy0:cy1, cx0:cx1]
+        clean_alpha[cy0:cy1, cx0:cx1][box_d < 38.0] = 0.0
+
+    ink_colors_arr = np.array(ink_rgbs, dtype=np.float32)
+    quantized_rgb = ink_colors_arr[k_star]
+
+    flat_quantized = np.zeros((H, W, 3), dtype=np.uint8)
+    fg_mask = clean_alpha >= 0.50
+    flat_quantized[:] = np.clip(np.round(B), 0, 255).astype(np.uint8)
+    flat_quantized[fg_mask] = np.clip(np.round(quantized_rgb[fg_mask]), 0, 255).astype(np.uint8)
+
+    return flat_quantized, k_star, clean_alpha, dist_to_bg
+
+
+def run_vector_knockout(
+    input_pil: Image.Image,
+    input_path: str,
+    output_png: str,
+    output_svg: str,
+    dpi: Tuple[int, int],
+    palette: Optional[str] = None,
+    inks: int = 0,
+    filter_speckle: int = 16,
+    merge_hue_tol: float = 12.0,
+    esrgan_model: str = "realesrgan-x4plus-anime",
+    vtracer_bin: Optional[str] = None,
+    svg_bg_thresh: float = 22.0,
+    fg_thresh: float = 25.0,
+    border_pct: float = 0.025,
+    manual_bg_rgb: Optional[np.ndarray] = None,
+    protect_interior_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    cutout_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    seal_boxes: Optional[List[Tuple[int, int, int, int, int]]] = None,
+    protect_polys: Optional[List[np.ndarray]] = None,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, int, List[str]]:
+    """
+    Executes Candidate B vector prepress knockout workflow:
+    Real-ESRGAN (2x) + Continuous Background Field B(x,y) + Spot-Color Palette Determination +
+    Strict Spot-Color Ray Unmixing & 7x7 Local Core Support + Strictly Flat (K+1)-Color Raster +
+    Cutout Spline VTracer + Background Path Stripping & Exact Canonical Hex Snapping +
+    Clean Scalable Cutout SVG + resvg 300 DPI RGBA Render.
+    """
+    # Validate explicit spot-color palette upfront before expensive ESRGAN upscaling or background fitting
+    explicit_ink_rgbs: Optional[List[np.ndarray]] = None
+    explicit_canonical_hexes: Optional[List[str]] = None
+    if palette is not None:
+        hex_items = [h.strip() for h in palette.split(",") if h.strip()]
+        if not hex_items:
+            raise ValueError("--palette must specify at least one valid hex color")
+        explicit_ink_rgbs = [hex_to_rgb_255(h) for h in hex_items]
+        explicit_canonical_hexes = [normalize_hex(h) for h in hex_items]
+
+    w_orig, h_orig = input_pil.size
+    w_2x, h_2x = w_orig * 2, h_orig * 2
+
+    # Step 1: Upscale & denoise via Real-ESRGAN to 2x (w_2x, h_2x)
+    if verbose:
+        print(f"Step 1: Real-ESRGAN upscaling/denoising input to 2x ({w_2x}x{h_2x}) [model={esrgan_model}]...")
+    t_esrgan = time.perf_counter()
+    pil_2x = run_esrgan_upscale_2x(
+        pil_in=input_pil,
+        model_name=esrgan_model,
+        target_w=w_2x,
+        target_h=h_2x,
+        verbose=verbose,
+    )
+    img_2x_u8 = np.array(pil_2x)
+    if verbose:
+        print(f"Real-ESRGAN completed in {time.perf_counter() - t_esrgan:.2f}s")
+
+    # Step 2: Fit continuous background field B(x, y) on 2x image
+    if verbose:
+        print("Fitting continuous background field B(x, y) on 2x image...")
+    img_2x_f64 = img_2x_u8.astype(np.float64) / 255.0
+    B_field, mean_B, sigma_bg, p99_border_dE = fit_background_field(
+        img_2x_f64,
+        border_pct=border_pct,
+        manual_bg_rgb=manual_bg_rgb,
+    )
+    bg_rgb_255 = (mean_B * 255.0).astype(np.float32)
+
+    # Step 3: Determine Spot-Color Palette
+    if explicit_ink_rgbs is not None and explicit_canonical_hexes is not None:
+        ink_rgbs = explicit_ink_rgbs
+        canonical_hexes = explicit_canonical_hexes
+        if verbose:
+            print(f"Using explicit spot-color palette ({len(canonical_hexes)} inks): {', '.join(canonical_hexes)}")
+    else:
+        if verbose:
+            print(f"Auto-discovering spot-color palette (target inks={inks}, merge_hue_tol={merge_hue_tol})...")
+        ink_rgbs, canonical_hexes = discover_palette(
+            img_rgb=img_2x_u8,
+            bg_rgb=bg_rgb_255,
+            inks=inks,
+            merge_hue_tol=merge_hue_tol,
+            verbose=verbose,
+        )
+
+    # Scale declarative ROI regions to 2x grid
+    protect_interior_boxes_2x = [(x0 * 2, y0 * 2, x1 * 2, y1 * 2) for (x0, y0, x1, y1) in (protect_interior_boxes or [])]
+    protect_boxes_2x = [(x0 * 2, y0 * 2, x1 * 2, y1 * 2) for (x0, y0, x1, y1) in (protect_boxes or [])]
+    cutout_boxes_2x = [(x0 * 2, y0 * 2, x1 * 2, y1 * 2) for (x0, y0, x1, y1) in (cutout_boxes or [])]
+    seal_boxes_2x = [(x0 * 2, y0 * 2, x1 * 2, y1 * 2, r * 2) for (x0, y0, x1, y1, r) in (seal_boxes or [])]
+    protect_polys_2x = [p * 2 for p in (protect_polys or [])]
+
+    # Step 4: Strict Spot-Color Ray Unmixing & 7x7 Local Core Support
+    if verbose:
+        print(f"Unmixing 2x raster with {len(ink_rgbs)} spot inks + 7x7 local core support...")
+    t_unmix = time.perf_counter()
+    P_f32 = img_2x_u8.astype(np.float32)
+    flat_quantized, k_star, clean_alpha, dist_to_bg = unmix_spot_colors(
+        P=P_f32,
+        B=bg_rgb_255,
+        ink_rgbs=ink_rgbs,
+        protect_boxes_2x=protect_boxes_2x,
+        cutout_boxes_2x=cutout_boxes_2x,
+        protect_polys_2x=protect_polys_2x,
+        seal_boxes=seal_boxes_2x,
+        verbose=verbose,
     )
     if verbose:
-        print(f"Collinear pairs detected: {len(collinear_pairs)}")
-        for m, k, cos, L_m, L_k in collinear_pairs:
-            print(f"  Ink {m+1} ({rgb_to_hex(palette[m])}) -> Ink {k+1} ({rgb_to_hex(palette[k])}): cos={cos:.3f}, ratio={L_m/L_k:.2f}")
+        print(f"Ray unmixing & local core support finished in {time.perf_counter() - t_unmix:.2f}s")
 
-    # Spatial Gradient magnitude
-    grad_y = sobel(arr, axis=0) / 8.0
-    grad_x = sobel(arr, axis=1) / 8.0
-    grad_mag = np.sqrt(np.sum(grad_y**2 + grad_x**2, axis=-1))
+    # Step 5: Run VTracer on flat_quantized raster
+    vtracer_exe = resolve_vtracer_bin(vtracer_bin)
+    with tempfile.TemporaryDirectory() as td:
+        temp_flat_png = os.path.join(td, "flat_quantized_2x.png")
+        temp_raw_svg = os.path.join(td, "vtracer_raw.svg")
+        Image.fromarray(flat_quantized).save(temp_flat_png)
 
-    # Local contrast envelope (scales with resolution)
-    env_size = max(3, int(np.round(5 * scale_factor)) | 1)
-    max_fg_dist_5x5 = maximum_filter(fg_dist, size=env_size)
+        vtracer_cmd = [
+            vtracer_exe,
+            "--input", temp_flat_png,
+            "--output", temp_raw_svg,
+            "--colormode", "color",
+            "--hierarchical", "cutout",
+            "--mode", "spline",
+            "--filter_speckle", str(filter_speckle),
+            "--color_precision", "8",
+            "--corner_threshold", "55",
+        ]
+        if verbose:
+            print(f"Executing VTracer: {' '.join(vtracer_cmd)}")
+        t_vt = time.perf_counter()
+        subprocess.run(vtracer_cmd, check=True, timeout=120, capture_output=True, text=True)
+        if verbose:
+            print(f"VTracer finished in {time.perf_counter() - t_vt:.2f}s")
 
-    # Precompute per-ink rays and projections
-    V_all = np.zeros((H, W, K, 3), dtype=np.float32)
-    norm_sq_all = np.zeros((H, W, K), dtype=np.float32)
-    alpha_proj_all = np.zeros((H, W, K), dtype=np.float32)
-    euc_dists_to_inks = np.zeros((H, W, K), dtype=np.float32)
-
-    for k in range(K):
-        V_k = palette[k] - B_field
-        V_all[:, :, k, :] = V_k
-        nsq = np.sum(V_k**2, axis=-1)
-        norm_sq_all[:, :, k] = nsq
-        dot = np.sum(diff * V_k, axis=-1)
-        alpha_proj_all[:, :, k] = dot / np.maximum(nsq, 1e-6)
-        euc_dists_to_inks[:, :, k] = np.linalg.norm(arr_smoothed - palette[k], axis=-1)
-
-    if has_dual_polarity:
-        # Enforce ray-polarity alignment:
-        # Dark pixels cannot match bright inks; bright pixels cannot match dark inks
-        for k in bright_inks:
-            euc_dists_to_inks[:, :, k] = np.where(is_dark_pixel, 1e6, euc_dists_to_inks[:, :, k])
-        for k in dark_inks:
-            euc_dists_to_inks[:, :, k] = np.where(~is_dark_pixel, 1e6, euc_dists_to_inks[:, :, k])
-
-    euc_dist_to_bg = np.linalg.norm(arr_smoothed - B_field, axis=-1)
-
-    # Stack all Euclidean distances (K inks + 1 background)
-    all_entities = np.concatenate([euc_dists_to_inks, euc_dist_to_bg[:, :, None]], axis=-1)
-    closest_entity = np.argmin(all_entities, axis=-1)  # 0..K-1: ink, K: background
-
-    fg_mask = fg_dist > tau_low
-    dist_to_bg = distance_transform_edt(fg_mask)
-    thin_boundary_dist = 2.5 * scale_factor
-
-    # Map intermediate inks to their higher-contrast counterparts
-    intermediate_info: Dict[int, List[Tuple[int, float]]] = {}
-    for m, k, cos, L_m, L_k in collinear_pairs:
-        cutoff = L_m + 0.25 * (L_k - L_m)
-        intermediate_info.setdefault(m, []).append((k, cutoff))
-
-    # Identify connected components containing higher collinear inks (fixes ALG-01!)
-    fg_lbl, num_fg = label(fg_mask)
-    fg_lbl_flat = fg_lbl.ravel()
-    suppress_m_branches: Dict[int, np.ndarray] = {i: np.zeros((H, W), dtype=bool) for i in range(K)}
-    erode_m = max(1, int(np.round(2.0 * scale_factor)))
-    dilate_m_iter = int(np.round(2.0 * scale_factor))
-
-    # Precompute per-ink wide solids and dilations ONCE
-    m_wide_solid_all: Dict[int, np.ndarray] = {}
-    dilate_m_all: Dict[int, np.ndarray] = {}
-    for m in set(p[0] for p in collinear_pairs):
-        m_wide = binary_erosion(closest_entity == m, iterations=erode_m)
-        m_wide_solid_all[m] = m_wide
-        dilate_m_all[m] = binary_dilation(m_wide, iterations=dilate_m_iter)
-
-    for m, k, cos, L_m, L_k in collinear_pairs:
-        k_candidate_solid = (
-            (closest_entity == k)
-            & (alpha_proj_all[:, :, k] >= 0.70)
-            & (fg_dist >= L_m + 0.20 * (L_k - L_m))
+        # Step 6: Clean SVG, Strip Background Paths & Snap to Exact Canonical Hexes
+        cutout_count = clean_vtracer_svg(
+            raw_svg_path=temp_raw_svg,
+            out_svg_path=output_svg,
+            w_orig=w_orig,
+            h_orig=h_orig,
+            w_2x=w_2x,
+            h_2x=h_2x,
+            bg_rgb=bg_rgb_255,
+            ink_rgbs=ink_rgbs,
+            canonical_hexes=canonical_hexes,
+            protect_interior_boxes_2x=protect_interior_boxes_2x,
+            protect_boxes_2x=protect_boxes_2x,
+            cutout_boxes_2x=cutout_boxes_2x,
+            protect_polys_2x=protect_polys_2x,
+            verbose=verbose,
         )
-        if np.any(k_candidate_solid) and num_fg > 0:
-            k_solid_counts = np.bincount(fg_lbl_flat, weights=k_candidate_solid.ravel(), minlength=num_fg + 1)
-            k_comp_lookup = k_solid_counts > 0
-            k_comp_lookup[0] = False
 
-            m_solid_counts = np.bincount(fg_lbl_flat, weights=m_wide_solid_all[m].ravel(), minlength=num_fg + 1)
-            suppress_entire_lookup = k_comp_lookup & (m_solid_counts == 0)
-            suppress_branch_lookup = k_comp_lookup & (m_solid_counts > 0)
+    # Step 7: Render Clean Cutout SVG to W x H RGBA via resvg_py
+    if verbose:
+        print(f"Rendering Clean Cutout SVG via resvg_py at {w_orig}x{h_orig} px ({dpi[0]} DPI)...")
+    t_render = time.perf_counter()
+    png_bytes = resvg_py.svg_to_bytes(svg_path=output_svg, width=w_orig, height=h_orig)
+    out_pil = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    os.makedirs(os.path.dirname(os.path.abspath(output_png)), exist_ok=True)
+    out_pil.save(output_png, dpi=dpi)
+    if verbose:
+        print(f"Rendered PNG saved to {output_png} in {time.perf_counter() - t_render:.2f}s")
 
-            if np.any(suppress_entire_lookup):
-                suppress_m_branches[m] |= suppress_entire_lookup[fg_lbl]
-            if np.any(suppress_branch_lookup):
-                in_branch_comp = suppress_branch_lookup[fg_lbl]
-                suppress_m_branches[m] |= in_branch_comp & (~dilate_m_all[m]) & (dist_to_bg <= thin_boundary_dist * 1.5)
+    rgba_u8 = np.array(out_pil)
+    F_out = rgba_u8[:, :, :3].astype(np.float64) / 255.0
+    alpha_out = rgba_u8[:, :, 3].astype(np.float64) / 255.0
 
-    # =========================================================================
-    # Step A: Solid Core Seeding
-    # =========================================================================
-    core_map = np.full((H, W), -1, dtype=np.int32)
-
-    # Process inks in descending order of ray length L_k so higher-contrast inks seed first
-    ink_order = np.argsort(-norms)
-    for k in ink_order:
-        is_interior = dist_to_bg > thin_boundary_dist
-
-        # For dark inks in dual-polarity images, allow lower contrast floor since L_k is smaller
-        is_dark_k = (k in dark_inks) if has_dual_polarity else False
-        min_proj = 0.60 if is_dark_k else 0.72
-
-        cand_boundary = (~is_interior) & (closest_entity == k) & (alpha_proj_all[:, :, k] >= min_proj) & (fg_dist > tau_low)
-        if has_dual_polarity and (k in dark_inks):
-            # Prevent 1px JPEG dark-undershoot rings right outside bright text from seeding false dark cores
-            cand_boundary &= (grad_mag < 25.0) & (alpha_proj_all[:, :, k] >= 0.80)
-        cand_interior = is_interior & (closest_entity == k)
-        cand = cand_boundary | cand_interior
-
-        # Collinear intermediate ink protection on boundary slopes
-        # ONLY apply grad_mag and max_fg_dist suppression near background boundary (~is_interior)
-        if k in intermediate_info:
-            for higher_k, cutoff in intermediate_info[k]:
-                cand &= (~cand_boundary | (max_fg_dist_5x5 <= cutoff))
-                cand &= (~cand_boundary | (grad_mag < 25.0))
-            if k in suppress_m_branches:
-                cand &= ~suppress_m_branches[k]
-
-        core_map[cand] = k
-
-    # Additional suppression: if intermediate ink m is within boundary zone of higher ink k solid core
-    for m, k, cos, L_m, L_k in collinear_pairs:
-        k_core = (core_map == k)
-        if np.any(k_core):
-            dist_to_k_core = distance_transform_edt(~k_core)
-            leak = (core_map == m) & (dist_to_k_core <= thin_boundary_dist) & (max_fg_dist_5x5 > L_m + 0.20 * (L_k - L_m))
-            core_map[leak] = -1
-
-    # =========================================================================
-    # Step D (Part 1): Isolated Sub-Pixel Component Seeding (Snowflakes, Stars)
-    # =========================================================================
-    fg_islands = (fg_dist > tau_low) & (fg_dist > 10.0)
-    lbl, num_features = label(fg_islands)
-    if num_features > 0:
-        slices = find_objects(lbl)
-        for c, sl in enumerate(slices, start=1):
-            if sl is None:
-                continue
-            comp_local = (lbl[sl] == c)
-            core_sub = core_map[sl]
-            if not np.any(core_sub[comp_local] >= 0):
-                dists_in_comp = fg_dist[sl][comp_local]
-                peak_idx = int(np.argmax(dists_in_comp))
-                peak_ys, peak_xs = np.where(comp_local)
-                py, px = peak_ys[peak_idx], peak_xs[peak_idx]
-                peak_diff = arr_smoothed[sl][py, px] - B_field[sl][py, px]
-                norm_p = float(np.linalg.norm(peak_diff))
-                if norm_p > 1e-3:
-                    u_peak = peak_diff / norm_p
-                    scores = [
-                        float(np.dot(u_peak, vecs[ik] / max(norms[ik], 1e-4)))
-                        for ik in range(K)
-                    ]
-                    best_k = int(np.argmax(scores))
-                    core_sub[comp_local] = best_k
-
-    # =========================================================================
-    # Step B: Nearest-Core Voronoi Propagation
-    # =========================================================================
-    has_core = (core_map >= 0)
-    propagated_ink = np.zeros((H, W), dtype=np.int32)
-    if np.any(has_core):
-        if has_dual_polarity:
-            has_core_dark = has_core & np.isin(core_map, dark_inks)
-            has_core_bright = has_core & np.isin(core_map, bright_inks)
-            if np.any(has_core_dark) and np.any(has_core_bright):
-                dist_to_dark_core, (ny_d, nx_d) = distance_transform_edt(~has_core_dark, return_indices=True)
-                prop_dark = core_map[ny_d, nx_d]
-
-                _, (ny_b, nx_b) = distance_transform_edt(~has_core_bright, return_indices=True)
-                prop_bright = core_map[ny_b, nx_b]
-
-                use_dark = is_dark_pixel & (dist_to_dark_core <= 3.0 * scale_factor)
-                propagated_ink = np.where(use_dark, prop_dark, prop_bright)
-            else:
-                _, (nearest_y, nearest_x) = distance_transform_edt(~has_core, return_indices=True)
-                propagated_ink = core_map[nearest_y, nearest_x]
-        else:
-            _, (nearest_y, nearest_x) = distance_transform_edt(~has_core, return_indices=True)
-            propagated_ink = core_map[nearest_y, nearest_x]
-
-    # Clean edge snap: Any anti-aliased edge pixel assigned to intermediate ink m
-    # that borders higher ink k's solid core or is on thin branches of k's component snaps to higher ink k
-    for m, k, cos, L_m, L_k in collinear_pairs:
-        k_core = (core_map == k)
-        if np.any(k_core):
-            dist_to_k_core = distance_transform_edt(~k_core)
-            edge_leak = (
-                (propagated_ink == m)
-                & (dist_to_k_core <= thin_boundary_dist)
-                & (max_fg_dist_5x5 > L_m + 0.20 * (L_k - L_m))
-            )
-            propagated_ink[edge_leak] = k
-        if m in suppress_m_branches:
-            branch_leak = (propagated_ink == m) & suppress_m_branches[m]
-            propagated_ink[branch_leak] = k
-
-        # Component majority rule (vectorized bincount):
-        if num_fg > 0:
-            k_pix_counts = np.bincount(fg_lbl_flat, weights=(core_map == k).ravel(), minlength=num_fg + 1)
-            m_pix_counts = np.bincount(fg_lbl_flat, weights=(core_map == m).ravel(), minlength=num_fg + 1)
-            majority_k_lookup = (k_pix_counts > m_pix_counts) & (k_pix_counts > 0)
-            majority_k_lookup[0] = False
-            if np.any(majority_k_lookup):
-                in_maj_comp = majority_k_lookup[fg_lbl]
-                thin_tips = in_maj_comp & (propagated_ink == m) & (dist_to_bg <= thin_boundary_dist * 1.5)
-                propagated_ink[thin_tips] = k
-
-    assigned_ink_labels = propagated_ink.copy()
-
-    # Morphological despeckling: aspect-ratio and stroke-aware (fixes ALG-02 & ALG-04!)
-    eff_despeckle = int(np.round(despeckle_size * (scale_factor ** 2)))
-    max_speckle_dim = max(4, int(np.round(5 * scale_factor)))
-    if eff_despeckle > 0 and mode == "screenprint":
-        small_mask = np.zeros((H, W), dtype=bool)
-        for k in range(K):
-            k_mask = (assigned_ink_labels == k) & (fg_dist > tau_low)
-            lbl_k, n_feat = label(k_mask)
-            if n_feat > 0:
-                counts = np.bincount(lbl_k.ravel(), minlength=n_feat + 1)
-                small_ids = np.where((counts <= eff_despeckle) & (counts > 0))[0]
-                small_ids = small_ids[small_ids > 0]
-                if len(small_ids) > 0:
-                    slices_k = find_objects(lbl_k)
-                    for sc in small_ids:
-                        sl = slices_k[sc - 1]
-                        if sl is None:
-                            continue
-                        h = sl[0].stop - sl[0].start
-                        w = sl[1].stop - sl[1].start
-                        max_dim = max(h, w)
-                        min_dim = max(1, min(h, w))
-                        aspect_ratio = max_dim / min_dim
-                        # Only mark as speckle if compact 2D island; never erase elongated 1D strokes!
-                        if max_dim < max_speckle_dim and aspect_ratio < 2.5:
-                            comp_sc = (lbl_k[sl] == sc)
-                            small_mask[sl][comp_sc] = True
-
-        clean_non_small = (fg_dist > tau_low) & (~small_mask)
-        if np.any(clean_non_small) and np.any(small_mask):
-            _, (ny, nx) = distance_transform_edt(~clean_non_small, return_indices=True)
-            assigned_ink_labels[small_mask] = assigned_ink_labels[ny[small_mask], nx[small_mask]]
-
-    assigned_inks = palette[assigned_ink_labels]
-
-    # =========================================================================
-    # Step C: Exact Ray-Projected Alpha on the Propagated Ink
-    # =========================================================================
-    V = assigned_inks - B_field
-    norm_sq_V = np.sum(V**2, axis=-1)
-    L_k = np.sqrt(norm_sq_V)
-    dot_diff_V = np.sum(diff * V, axis=-1)
-    alpha_raw = np.clip(dot_diff_V / np.maximum(norm_sq_V, 1e-6), 0.0, 1.0)
-
-    # Step D (Part 2): Ridge boost for thin sub-pixel features (snowflakes, filigree)
-    ridge_kernel_size = max(3, int(np.round(3 * scale_factor)) | 1)
-    alpha_ridge = maximum_filter(alpha_raw, size=ridge_kernel_size)
-    ridge_mask = (alpha_ridge >= 0.35) & (alpha_ridge <= 0.85)
-    denom = np.maximum(0.85, alpha_ridge * 1.05)
-    alpha_boosted = np.where(ridge_mask, np.clip(alpha_raw / denom, 0.0, 1.0), alpha_raw)
-
-    # Adaptive contrast-scaled noise floor and alpha knee (fixes ALG-03!):
-    # Scale mosquito gate proportionally for low-contrast inks (Dark Pine Green, Dark Brown)
-    s_contrast = np.clip((L_k - 60.0) / 90.0, 0.0, 1.0)
-    tau_dark = np.minimum(tau_low, 0.06 * L_k)
-    tau_bright = np.maximum(tau_low, 10.0)
-    tau_ink_adaptive = (1.0 - s_contrast) * tau_dark + s_contrast * tau_bright
-
-    alpha_knee_eff = alpha_knee * np.clip((L_k - 30.0) / 120.0, 0.35, 1.0)
-
-    is_noise = (fg_dist <= tau_ink_adaptive) | (alpha_boosted <= alpha_knee_eff)
-
-    # Continuous alpha curve with Hermite knee
-    alpha_norm = np.clip(
-        (alpha_boosted - alpha_knee_eff) / np.maximum(alpha_solid - alpha_knee_eff, 1e-4),
-        0.0,
-        1.0,
-    )
-    k_knee = np.clip(alpha_norm / 0.15, 0.0, 1.0)
-    w_knee = k_knee * k_knee * (3.0 - 2.0 * k_knee)
-    alpha_final = np.where(alpha_norm >= 1.0, 1.0, alpha_norm * w_knee)
-
-    if alpha_power != 1.0:
-        alpha_final = alpha_final ** alpha_power
-
-    # Interior solid snap: interior pixels with solid projection snap to 100% opacity
-    dist_to_bg_noise = distance_transform_edt(~is_noise)
-    interior_solid = (~is_noise) & (alpha_boosted >= alpha_solid) & (dist_to_bg_noise > 2.0 * scale_factor)
-    alpha_final[interior_solid] = 1.0
-    alpha_final[is_noise] = 0.0
-
-    alpha_u8 = np.clip(np.round(alpha_final * 255.0), 0, 255).astype(np.uint8)
-    alpha_u8[alpha_u8 <= 2] = 0
-
-    # =========================================================================
-    # Step E: Two-Regime Color Physics
-    # =========================================================================
-    rgba = np.zeros((H, W, 4), dtype=np.uint8)
-    rgba[:, :, 3] = alpha_u8
-
-    pure_rgb = np.clip(np.round(assigned_inks), 0, 255).astype(np.float32)
-
-    if mode == "dtg":
-        # Hybrid Pure-Palette Boundary + Continuous Deep Interior:
-        # 1. Boundary pixels, thin strokes, and filigree (dist_to_bg <= 2.5 * scale_factor or alpha_u8 < 255)
-        #    use 100% pure uncontaminated palette ink (pure_rgb), guaranteeing ZERO background fringing
-        #    and 100% crisp solid color on thin strokes (castle lines, pine needles, snowflakes, stars).
-        # 2. Deep interior pixels (dist_to_bg > 2.5 * scale_factor, alpha_u8 == 255, alpha_raw >= 0.90)
-        #    smoothly ramp to continuous arr_smoothed, preserving 100% of inner highlight stripes
-        #    and smooth shading without any quantization or erosion.
-        ramp_start = 2.5 * scale_factor
-        ramp_width = 1.0 * scale_factor
-        w_interior = np.clip((dist_to_bg - ramp_start) / ramp_width, 0.0, 1.0)
-        # Zero interior weight on non-solid or boundary-blended pixels
-        w_interior[(alpha_u8 < 255) | (alpha_raw < 0.90)] = 0.0
-
-        out_rgb = (1.0 - w_interior)[..., None] * pure_rgb + w_interior[..., None] * arr_smoothed
-        rgba[alpha_u8 > 0, :3] = np.clip(np.round(out_rgb[alpha_u8 > 0]), 0, 255).astype(np.uint8)
-    else:
-        # Strict discrete palette colors for screenprint across all foreground pixels
-        rgba[alpha_u8 > 0, :3] = np.clip(np.round(pure_rgb[alpha_u8 > 0]), 0, 255).astype(np.uint8)
-
-    rgba[alpha_u8 == 0, :3] = 0
-
-    # Halo leak validation score
-    halo_count = 0
-    for m, k, cos, L_m, L_k in collinear_pairs:
-        k_solid = (assigned_ink_labels == k) & (alpha_u8 >= 200)
-        m_pixels = (assigned_ink_labels == m) & (alpha_u8 > 0)
-        if np.any(k_solid) and np.any(m_pixels):
-            dist_to_k = distance_transform_edt(~k_solid)
-            halo_leak = np.sum(
-                m_pixels
-                & (dist_to_k <= 2.5 * scale_factor)
-                & (dist_to_bg_noise <= 2.5 * scale_factor)
-                & (max_fg_dist_5x5 > L_m + 0.35 * (L_k - L_m))
-            )
-            halo_count += int(halo_leak)
-
-    metrics = {
-        "mode": mode,
-        "dimensions": [W, H],
-        "total_pixels": int(H * W),
-        "transparent_pixels": int(np.sum(alpha_u8 == 0)),
-        "opaque_pixels": int(np.sum(alpha_u8 == 255)),
-        "translucent_pixels": int(np.sum((alpha_u8 > 0) & (alpha_u8 < 255))),
-        "foreground_pixels": int(np.sum(alpha_u8 > 0)),
-        "halo_leak_pixels": halo_count,
-        "solid_core_pixels": int(np.sum(has_core)),
-    }
-    return rgba, assigned_ink_labels, alpha_u8, metrics
+    return F_out, alpha_out, mean_B, sigma_bg, p99_border_dE, cutout_count, canonical_hexes
 
 
-def generate_preview_image(arr: np.ndarray, rgba: np.ndarray) -> Image.Image:
+# =============================================================================
+# STAGE 6: Prepress Verification Sheet & 1:1 Native Resolution Crops
+# =============================================================================
+
+def composite_on_backdrop(F: np.ndarray, alpha: np.ndarray, bg_rgb: np.ndarray) -> np.ndarray:
+    """Composites unmixed foreground and alpha over a constant background RGB."""
+    comp = F * alpha[:, :, None] + bg_rgb[None, None, :] * (1.0 - alpha[:, :, None])
+    return (np.clip(comp, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+
+def generate_verify_composite(
+    F_final: np.ndarray,
+    alpha_final: np.ndarray,
+    output_path: str,
+) -> None:
     """
-    Builds a high-definition 4-panel verification composite with labelled banners:
-      1. Original Input Image
-      2. Transparent PNG over High-Contrast Checkerboard (20x20 squares)
-      3. Transparent PNG over Light Parchment (#F7F4EB)
-      4. Transparent PNG over Dark Charcoal (#181818)
+    Generates a clean, labeled 2x2 prepress verification sheet:
+    - Top-Left: Over Dark (#18181B)
+    - Top-Right: Over White (#FFFFFF)
+    - Bottom-Left: Over Warm Cream (#F4EFE6)
+    - Bottom-Right: Alpha Mask ([alpha, alpha, alpha])
     """
-    from PIL import ImageDraw
+    H, W, _ = F_final.shape
 
-    H, W, _ = arr.shape
-    alpha_u8 = rgba[:, :, 3]
-    a_f = (alpha_u8.astype(np.float32) / 255.0)[:, :, None]
-    rgb_f = rgba[:, :, :3].astype(np.float32)
+    dark_bg = np.array([24, 24, 27], dtype=np.float64) / 255.0
+    white_bg = np.array([255, 255, 255], dtype=np.float64) / 255.0
+    cream_bg = np.array([244, 239, 230], dtype=np.float64) / 255.0
 
-    p1 = np.round(arr).astype(np.uint8)
+    panel_dark = composite_on_backdrop(F_final, alpha_final, dark_bg)
+    panel_white = composite_on_backdrop(F_final, alpha_final, white_bg)
+    panel_cream = composite_on_backdrop(F_final, alpha_final, cream_bg)
+    alpha_u8 = (np.clip(alpha_final, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    panel_mask = np.stack([alpha_u8, alpha_u8, alpha_u8], axis=-1)
 
-    # Panel 2: Checkerboard
-    yy, xx = np.indices((H, W))
-    checker = ((yy // 20) + (xx // 20)) % 2
-    checker_bg = np.where(checker[:, :, None] == 1, 245.0, 195.0)
-    p2 = np.round(a_f * rgb_f + (1.0 - a_f) * checker_bg).astype(np.uint8)
+    header_h = max(36, int(H * 0.025))
+    font_size = max(18, int(header_h * 0.55))
+    font = get_system_font(font_size)
 
-    # Panel 3: Light Parchment (#F7F4EB)
-    parch_bg = np.array([247.0, 244.0, 235.0], dtype=np.float32)
-    p3 = np.round(a_f * rgb_f + (1.0 - a_f) * parch_bg).astype(np.uint8)
+    def make_cell(panel_arr: np.ndarray, label: str) -> Image.Image:
+        cell_img = Image.new("RGB", (W, H + header_h), color=(20, 20, 24))
+        draw = ImageDraw.Draw(cell_img)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = (W - tw) // 2
+        ty = (header_h - th) // 2
+        draw.text((tx, ty), label, fill=(240, 240, 245), font=font)
+        cell_img.paste(Image.fromarray(panel_arr), (0, header_h))
+        return cell_img
 
-    # Panel 4: Dark Charcoal (#181818)
-    dark_bg = np.array([24.0, 24.0, 24.0], dtype=np.float32)
-    p4 = np.round(a_f * rgb_f + (1.0 - a_f) * dark_bg).astype(np.uint8)
+    cell_dark = make_cell(panel_dark, "Over Dark (#18181B)")
+    cell_white = make_cell(panel_white, "Over White (#FFFFFF)")
+    cell_cream = make_cell(panel_cream, "Over Warm Cream (#F4EFE6)")
+    cell_mask = make_cell(panel_mask, "Alpha Matte Mask")
 
-    preview_arr = np.concatenate([p1, p2, p3, p4], axis=1)
-    preview_img = Image.fromarray(preview_arr, mode="RGB")
-    draw = ImageDraw.Draw(preview_img)
+    # Arrange 2x2
+    sheet_w = 2 * W
+    sheet_h = 2 * (H + header_h)
+    sheet = Image.new("RGB", (sheet_w, sheet_h), color=(15, 15, 18))
+    sheet.paste(cell_dark, (0, 0))
+    sheet.paste(cell_white, (W, 0))
+    sheet.paste(cell_cream, (0, H + header_h))
+    sheet.paste(cell_mask, (W, H + header_h))
 
-    labels = [
-        ("1. Original Input", 20, 20),
-        ("2. Transparent PNG (Checkerboard)", W + 20, 20),
-        ("3. Light Parchment (#F7F4EB)", 2 * W + 20, 20),
-        ("4. Dark Charcoal (#181818)", 3 * W + 20, 20),
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    sheet.save(output_path, dpi=(300, 300))
+
+
+def select_diverse_crops(
+    H: int,
+    W: int,
+    thin_ridges: np.ndarray,
+    unknown_mask: np.ndarray,
+    valid_cutouts: np.ndarray,
+    silhouette_mask: np.ndarray,
+    crop_size: int = 400,
+) -> List[Tuple[int, int, int, int, str]]:
+    """
+    Selects 4 diverse, non-overlapping crop windows scoring high on:
+    1. Thin-stroke ridge density
+    2. Transition/unknown-band perimeter complexity
+    3. Interior cutouts/counters
+    4. Outer silhouette edge contrast
+    """
+    cw = min(crop_size, W)
+    ch = min(crop_size, H)
+
+    # Compute fast 2D integral images
+    int_ridge = cv2.integral(thin_ridges.astype(np.float32))
+    int_unknown = cv2.integral(unknown_mask.astype(np.float32))
+    int_cutout = cv2.integral(valid_cutouts.astype(np.float32))
+    int_sil = cv2.integral(silhouette_mask.astype(np.float32))
+
+    def get_sum(ii: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
+        return float(ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0])
+
+    step = max(30, crop_size // 8)
+    cand_x = list(range(0, W - cw + 1, step))
+    cand_y = list(range(0, H - ch + 1, step))
+    if cand_x[-1] != (W - cw):
+        cand_x.append(W - cw)
+    if cand_y[-1] != (H - ch):
+        cand_y.append(H - ch)
+
+    candidates = [(x, y, x + cw, y + ch) for y in cand_y for x in cand_x]
+
+    chosen_boxes: List[Tuple[int, int, int, int]] = []
+    chosen_crops: List[Tuple[int, int, int, int, str]] = []
+
+    def is_overlapping(box: Tuple[int, int, int, int]) -> bool:
+        bx0, by0, bx1, by1 = box
+        for cx0, cy0, cx1, cy1 in chosen_boxes:
+            ix0 = max(bx0, cx0)
+            iy0 = max(by0, cy0)
+            ix1 = min(bx1, cx1)
+            iy1 = min(by1, cy1)
+            if ix1 > ix0 and iy1 > iy0:
+                inter_area = (ix1 - ix0) * (iy1 - iy0)
+                if inter_area > 0.15 * cw * ch:
+                    return True
+        return False
+
+    categories = [
+        ("Thin Filigree & Fine Ridges", int_ridge),
+        ("Transition & Unknown-Band Perimeter", int_unknown),
+        ("Interior Cutouts & Counters", int_cutout),
+        ("Outer Silhouette Edge Contrast", int_sil),
     ]
 
-    for text, lx, ly in labels:
-        bbox = [lx - 6, ly - 4, lx + len(text) * 9 + 12, ly + 22]
-        draw.rectangle(bbox, fill=(0, 0, 0, 190))
-        draw.text((lx, ly), text, fill=(255, 255, 255))
+    for cat_name, int_map in categories:
+        best_cand = None
+        best_score = -1.0
+        for box in candidates:
+            if is_overlapping(box):
+                continue
+            score = get_sum(int_map, *box)
+            if score > best_score:
+                best_score = score
+                best_cand = box
 
-    return preview_img
+        if best_cand is None or best_score <= 0.0:
+            # Fallback: pick highest remaining score or center region
+            for box in candidates:
+                if not is_overlapping(box):
+                    best_cand = box
+                    break
+
+        if best_cand is not None:
+            chosen_boxes.append(best_cand)
+            chosen_crops.append((*best_cand, cat_name))
+
+    return chosen_crops
 
 
-def parse_args() -> argparse.Namespace:
+def generate_detail_crops(
+    img_orig_u8: np.ndarray,
+    F_final: np.ndarray,
+    alpha_final: np.ndarray,
+    crops_info: List[Tuple[int, int, int, int, str]],
+    output_dir: str,
+) -> List[str]:
+    """
+    Generates 4-column 1:1 native-resolution diagnostic strips for each crop region:
+    Original Input | Over Dark (#18181B) | Over White (#FFFFFF) | Over Warm Cream (#F4EFE6)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    saved_paths = []
+
+    dark_bg = np.array([24, 24, 27], dtype=np.float64) / 255.0
+    white_bg = np.array([255, 255, 255], dtype=np.float64) / 255.0
+    cream_bg = np.array([244, 239, 230], dtype=np.float64) / 255.0
+
+    col_titles = [
+        "Original Input",
+        "Over Dark #18181B",
+        "Over White #FFFFFF",
+        "Over Cream #F4EFE6",
+    ]
+
+    font_title = get_system_font(18)
+    font_col = get_system_font(15)
+
+    pad = 8
+    header_h = 64
+
+    H, W = img_orig_u8.shape[:2]
+    for idx, (x0, y0, x1, y1, label) in enumerate(crops_info):
+        x0, y0, x1, y1 = clamp_box(x0, y0, x1, y1, W, H)
+        cw = x1 - x0
+        ch = y1 - y0
+        if cw <= 0 or ch <= 0:
+            continue
+
+        crop_orig = img_orig_u8[y0:y1, x0:x1]
+        crop_F = F_final[y0:y1, x0:x1]
+        crop_alpha = alpha_final[y0:y1, x0:x1]
+
+        crop_dark = composite_on_backdrop(crop_F, crop_alpha, dark_bg)
+        crop_white = composite_on_backdrop(crop_F, crop_alpha, white_bg)
+        crop_cream = composite_on_backdrop(crop_F, crop_alpha, cream_bg)
+
+        col_images = [crop_orig, crop_dark, crop_white, crop_cream]
+
+        strip_w = 4 * cw + 5 * pad
+        strip_h = ch + header_h + 2 * pad
+
+        strip = Image.new("RGB", (strip_w, strip_h), color=(18, 18, 22))
+        draw = ImageDraw.Draw(strip)
+
+        # Main Strip Header
+        title_text = f"1:1 Native Resolution Diagnostic Crop #{idx+1}: {label} [X:{x0}-{x1}, Y:{y0}-{y1}]"
+        draw.text((pad + 4, 10), title_text, fill=(245, 245, 250), font=font_title)
+
+        # Columns
+        for c_idx, (col_img, col_name) in enumerate(zip(col_images, col_titles)):
+            cx = pad + c_idx * (cw + pad)
+            cy = header_h
+
+            # Column title
+            bbox = draw.textbbox((0, 0), col_name, font=font_col)
+            tw = bbox[2] - bbox[0]
+            tx = cx + (cw - tw) // 2
+            draw.text((tx, 38), col_name, fill=(210, 215, 225), font=font_col)
+
+            # Paste image
+            strip.paste(Image.fromarray(col_img), (cx, cy))
+            draw.rectangle([cx - 1, cy - 1, cx + cw, cy + ch], outline=(60, 60, 70), width=1)
+
+        slug = "".join(c if c.isalnum() else "_" for c in label.lower()).strip("_")
+        crop_filename = f"crop_{idx+1}_{slug}.png"
+        out_crop_path = os.path.join(output_dir, crop_filename)
+        strip.save(out_crop_path, dpi=(300, 300))
+        saved_paths.append(out_crop_path)
+
+    return saved_paths
+
+
+# =============================================================================
+# MAIN CLI ENTRYPOINT
+# =============================================================================
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Knockout Background Removal, Continuous Unmixing & Discrete Color Quantization",
+        description="Universal Prepress Knockout Background Removal & Alpha Unmixing (PyMatting + Known-B)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input", help="Path to input image file (JPEG, PNG, WebP)")
-    parser.add_argument("-o", "--output", help="Path to output transparent PNG file")
-    parser.add_argument("-p", "--preview", nargs="?", const="", help="Path to 4-panel verification preview image")
+    parser.add_argument("-o", "--output", help="Destination transparent PNG path")
     parser.add_argument(
         "--mode",
-        choices=["dtg", "screenprint"],
-        default="screenprint",
-        help="Target printing technology: 'screenprint' (discrete palette quantization, default) or 'dtg' (continuous background unmixing & color decontamination)",
+        choices=["vector", "dtg", "dtf", "screenprint"],
+        default="vector",
+        help="Target printing technology mode (vector: Spot-Color Ray Unmixing + Cutout Spline VTracer SVG, dtg: continuous unmixing, dtf: firm alpha floor, screenprint: spot-color quantization)",
+    )
+    parser.add_argument(
+        "--svg-output",
+        type=str,
+        help="Optional destination path for output .svg file (defaults to <stem>.svg when --mode vector)",
+    )
+    parser.add_argument(
+        "--esrgan-model",
+        choices=["realesrgan-x4plus-anime", "realesr-animevideov3", "none"],
+        default="realesrgan-x4plus-anime",
+        help="Real-ESRGAN model for vector mode upscaling/denoising",
+    )
+    parser.add_argument(
+        "--vtracer-bin",
+        type=str,
+        help="Path to vtracer binary (auto-resolved from PATH or ~/.cargo/bin/vtracer if not provided)",
+    )
+    parser.add_argument(
+        "--svg-bg-thresh",
+        type=float,
+        default=22.0,
+        help="CIELAB delta_E threshold for deleting background-matching SVG <path> elements",
+    )
+    parser.add_argument(
+        "--scale",
+        "--upscale",
+        type=float,
+        default=1.0,
+        help="Optional upscale factor using Lanczos resampling (default: 1.0, preserves native resolution)",
     )
     parser.add_argument(
         "--quantize",
         action="store_true",
-        help="Shortcut for --mode screenprint (discrete spot-color quantization)",
+        help="Shortcut for --mode screenprint",
     )
-    parser.add_argument("--scale", "--upscale", type=int, default=1, dest="scale", help="Upscale factor for output PNG using Lanczos resampling (default: 1, preserves 100%% native resolution)")
-    parser.add_argument("--inspect", action="store_true", help="Inspect background, noise floor, and colors without saving image")
-    parser.add_argument("-k", "--n-colors", type=int, default=None, help="Number of foreground ink colors to discover (screenprint mode)")
-    parser.add_argument("--palette", help="Comma-separated hex colors (e.g. '#F5E0C9,#CC8F68,#E09622')")
-    parser.add_argument("--bg-color", help="Manual background color override in hex (e.g. '#181818')")
-    parser.add_argument("--margin-pct", type=float, default=0.03, help="Fraction of image boundary to sample for background (default: 0.03)")
-    parser.add_argument("--tau-low", type=float, default=None, help="Knockout distance threshold (auto if omitted)")
-    parser.add_argument("--tau-solid", type=float, default=None, help="Solid core seed threshold for screenprint mode (auto if omitted)")
-    parser.add_argument("--d-floor", type=float, default=None, help="Minimum solid stroke contrast floor for DTG local envelope (auto if omitted)")
-    parser.add_argument("--envelope-size", type=int, default=5, help="Local stroke contrast envelope neighborhood size (default: 5)")
-    parser.add_argument("--alpha-solid", type=float, default=0.85, help="Stroke ridge saturation factor for 100%% opacity (default: 0.85)")
-    parser.add_argument("--alpha-knee", type=float, default=0.18, help="Projection alpha noise deadzone knee (default: 0.18)")
-    parser.add_argument("--alpha-power", type=float, default=1.0, help="Alpha gamma curve power (default: 1.0; 1.2-1.5 for DTF adhesive falloff)")
-    parser.add_argument("--despeckle", type=int, default=20, help="Remove isolated single-ink islands smaller than N pixels in screenprint mode (default: 20)")
-    parser.add_argument("--collinear-threshold", type=float, default=0.75, help="Cosine similarity threshold for collinear inks (default: 0.75)")
-    parser.add_argument("--collinear-ratio", type=float, default=0.88, help="Norm ratio threshold for intermediate collinear inks (default: 0.88)")
-    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose diagnostic logs")
-    return parser.parse_args()
+    parser.add_argument(
+        "--dtf-alpha-floor",
+        type=float,
+        default=0.15,
+        help="DTF hot-melt adhesive alpha cutoff ramp floor",
+    )
+    parser.add_argument(
+        "-k",
+        "--colors",
+        type=int,
+        default=8,
+        help="Number of spot-color inks for --mode screenprint",
+    )
+    parser.add_argument(
+        "--palette",
+        type=str,
+        help="Explicit comma-separated hex colors (e.g. '#FFFFFF,#000000,#E5A125')",
+    )
+    parser.add_argument(
+        "--inks",
+        type=int,
+        default=0,
+        help="Number of foreground spot inks (K) for --mode vector (0 = auto-discover 2..6 in CIELAB)",
+    )
+    parser.add_argument(
+        "--filter-speckle",
+        type=int,
+        default=16,
+        help="VTracer --filter_speckle threshold: discard patches smaller than X px (default: 16)",
+    )
+    parser.add_argument(
+        "--merge-hue-tol",
+        type=float,
+        default=12.0,
+        help="CIELAB delta_E tolerance for merging similar hues during auto-palette discovery (default: 12.0)",
+    )
+    parser.add_argument(
+        "--chroma-smooth",
+        dest="chroma_smooth",
+        action="store_true",
+        default=True,
+        help="Enable CIELAB bilateral chroma smoothing on a* and b*",
+    )
+    parser.add_argument(
+        "--no-chroma-smooth",
+        dest="chroma_smooth",
+        action="store_false",
+        help="Disable CIELAB bilateral chroma smoothing",
+    )
+    parser.add_argument(
+        "--chroma-sigma-color",
+        type=float,
+        default=12.0,
+        help="Bilateral filter sigmaColor for chroma channels",
+    )
+    parser.add_argument(
+        "--chroma-sigma-space",
+        type=float,
+        default=5.0,
+        help="Bilateral filter sigmaSpace for chroma channels",
+    )
+    parser.add_argument(
+        "--border-pct",
+        type=float,
+        default=0.025,
+        help="Outer border fraction used to fit continuous background field B(x,y)",
+    )
+    parser.add_argument(
+        "--bg-color",
+        type=str,
+        help="Manual background color hex override (e.g. '#18181B')",
+    )
+    parser.add_argument(
+        "--bg-thresh",
+        type=float,
+        default=6.5,
+        help="CIELAB delta_E threshold for background seed and interior cutout validation",
+    )
+    parser.add_argument(
+        "--fg-thresh",
+        type=float,
+        default=40.0,
+        help="CIELAB delta_E threshold for high-contrast foreground core",
+    )
+    parser.add_argument(
+        "--thin-thresh",
+        type=float,
+        default=32.0,
+        help="CIELAB delta_E threshold for thin 1-2px ridge preservation",
+    )
+    parser.add_argument(
+        "--unknown-band-px",
+        type=float,
+        default=6.0,
+        help="Euclidean distance boundary from true background into object interior",
+    )
+    parser.add_argument(
+        "--min-cutout-area",
+        type=int,
+        default=6,
+        help="Minimum pixel area for accepting interior negative space cutouts",
+    )
+    parser.add_argument(
+        "--protect-interior-box",
+        action="append",
+        default=[],
+        help="Suppress interior cutout holes in x0,y0,x1,y1 while preserving outer silhouette matting (repeatable)",
+    )
+    parser.add_argument(
+        "--protect-box",
+        action="append",
+        default=[],
+        help="Force definite foreground (trimap = 1.0) in x0,y0,x1,y1 (repeatable)",
+    )
+    parser.add_argument(
+        "--protect-poly",
+        action="append",
+        default=[],
+        help="Force definite solid foreground inside polygon 'x1,y1,x2,y2,x3,y3,...' (repeatable)",
+    )
+    parser.add_argument(
+        "--seal-box",
+        action="append",
+        default=[],
+        help="Topological outline gap sealing 'x0,y0,x1,y1[:radius]' to bridge outline gaps (repeatable)",
+    )
+    parser.add_argument(
+        "--cutout-box",
+        action="append",
+        default=[],
+        help="Relax interior cutout threshold inside x0,y0,x1,y1 for tiny holes (repeatable)",
+    )
+    parser.add_argument(
+        "-p",
+        "--preview",
+        "--verify-composite",
+        dest="verify_composite",
+        help="Output path for 2x2 prepress verification composite sheet",
+    )
+    parser.add_argument(
+        "--verify-crops-dir",
+        help="Directory to save 1:1 native-resolution diagnostic inspection crop strips",
+    )
+    parser.add_argument(
+        "--crop",
+        action="append",
+        default=[],
+        help="Manual 1:1 crop specification 'x,y,w,h:label' or 'x0,y0,x1,y1:label' (repeatable)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output summary statistics in structured JSON format",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print verbose diagnostic processing logs",
+    )
 
+    args = parser.parse_args()
 
-def main() -> int:
-    args = parse_args()
+    mode = "screenprint" if args.quantize else args.mode
 
-    if not os.path.isfile(args.input):
-        print(f"Error: Input file does not exist: {args.input}", file=sys.stderr)
-        return 1
+    if not os.path.exists(args.input):
+        sys.stderr.write(f"Error: Input file does not exist: {args.input}\n")
+        sys.exit(1)
 
-    try:
-        im = Image.open(args.input).convert("RGB")
-    except Exception as e:
-        print(f"Error opening image {args.input}: {e}", file=sys.stderr)
-        return 1
+    t_start = time.perf_counter()
 
-    arr = np.array(im, dtype=np.float32)
-    H, W, _ = arr.shape
+    # Determine output path
+    stem, _ = os.path.splitext(args.input)
+    output_path = args.output or f"{stem}_transparent.png"
+    out_stem, _ = os.path.splitext(output_path)
+    svg_output_path = args.svg_output or f"{out_stem}.svg"
 
-    scale_factor = float(min(H, W)) / 764.0
+    # Load input image
+    input_pil = Image.open(args.input).convert("RGB")
+    w_orig, h_orig = input_pil.size
+    dpi = input_pil.info.get("dpi", (300, 300))
+    if not isinstance(dpi, tuple) or len(dpi) != 2 or dpi[0] < 72:
+        dpi = (300, 300)
 
-    manual_bg = hex_to_rgb(args.bg_color) if args.bg_color else None
-    B_field, mean_B, sigma, auto_tau_low = fit_background_field(arr, margin_pct=args.margin_pct, manual_bg=manual_bg)
+    if args.scale > 1.0:
+        new_w = int(round(w_orig * args.scale))
+        new_h = int(round(h_orig * args.scale))
+        if args.verbose:
+            print(f"Upscaling input artwork from {w_orig}x{h_orig} to {new_w}x{new_h} (scale={args.scale}) via Lanczos...")
+        input_pil = input_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        w_orig, h_orig = input_pil.size
 
-    tau_low = args.tau_low if args.tau_low is not None else auto_tau_low
+    img_u8 = np.array(input_pil)
+    img_f64 = img_u8.astype(np.float64) / 255.0
 
-    # Determine mode
-    mode = args.mode
-    if args.quantize:
-        mode = "screenprint"
-    elif args.palette and "--mode" not in sys.argv:
-        mode = "screenprint"
-    elif args.n_colors is not None and "--mode" not in sys.argv:
-        mode = "screenprint"
+    if args.verbose:
+        print(f"Loaded input artwork: {args.input} ({w_orig}x{h_orig} px, DPI: {dpi})")
 
-    # Explicit palette parsing if specified
-    explicit_palette = None
-    if args.palette:
-        hex_tokens = [t.strip() for t in args.palette.split(",") if t.strip()]
-        explicit_palette = [hex_to_rgb(h) for h in hex_tokens]
+    # Parse ROI boxes and polygons
+    protect_interior_boxes = [parse_box(b) for b in args.protect_interior_box]
+    protect_boxes = [parse_box(b) for b in args.protect_box]
+    cutout_boxes = [parse_box(b) for b in args.cutout_box]
+    seal_boxes = [parse_seal_box(b) for b in args.seal_box]
+    protect_polys = [parse_poly(p) for p in args.protect_poly]
 
-    # Inspection Mode
-    if args.inspect:
-        report: Dict[str, Any] = {
-            "image": os.path.abspath(args.input),
-            "dimensions": [W, H],
-            "mode": mode,
-            "background": {
-                "hex": rgb_to_hex(mean_B),
-                "rgb": [float(c) for c in np.round(mean_B, 2)],
-                "noise_sigma": round(sigma, 3),
-                "tau_low_recommended": round(auto_tau_low, 2),
-                "tau_low_used": round(tau_low, 2),
-            },
-        }
+    manual_bg = hex_to_rgb_float(args.bg_color) if args.bg_color else None
 
-        diff = arr - B_field
-        fg_dist = np.linalg.norm(diff, axis=-1)
-        report["foreground_pixels_est"] = int(np.sum(fg_dist > tau_low))
-        report["max_contrast_distance"] = round(float(np.max(fg_dist)), 2)
+    if mode == "vector":
+        vector_fg_thresh = 25.0 if args.fg_thresh == 40.0 else max(25.0, args.fg_thresh)
 
-        palette = None
-        if mode == "screenprint" or args.n_colors or args.palette:
-            n_colors = len(explicit_palette) if explicit_palette else (args.n_colors or 4)
-            palette = discover_palette(
-                arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, scale_factor=scale_factor, explicit_palette=explicit_palette
+        F_out, alpha_out, mean_B, sigma_bg, p99_border_dE, cutout_count, palette_hex = run_vector_knockout(
+            input_pil=input_pil,
+            input_path=args.input,
+            output_png=output_path,
+            output_svg=svg_output_path,
+            dpi=dpi,
+            palette=args.palette,
+            inks=args.inks,
+            filter_speckle=args.filter_speckle,
+            merge_hue_tol=args.merge_hue_tol,
+            esrgan_model=args.esrgan_model,
+            vtracer_bin=args.vtracer_bin,
+            svg_bg_thresh=args.svg_bg_thresh,
+            fg_thresh=vector_fg_thresh,
+            border_pct=args.border_pct,
+            manual_bg_rgb=manual_bg,
+            protect_interior_boxes=protect_interior_boxes,
+            protect_boxes=protect_boxes,
+            cutout_boxes=cutout_boxes,
+            seal_boxes=seal_boxes,
+            protect_polys=protect_polys,
+            verbose=args.verbose,
+        )
+        bg_hex = rgb_to_hex(mean_B)
+        unmixing_time = 0.0
+    else:
+        # Stage 1: Edge-preserving CIELAB chroma smoothing
+        if args.chroma_smooth:
+            if args.verbose:
+                print(f"Applying Stage 1 CIELAB bilateral chroma smoothing (sigmaColor={args.chroma_sigma_color}, sigmaSpace={args.chroma_sigma_space})...")
+            img_proc = apply_chroma_smoothing(
+                img_f64,
+                sigma_color=args.chroma_sigma_color,
+                sigma_space=args.chroma_sigma_space,
             )
-            collinear_pairs = find_collinear_pairs(
-                palette, mean_B, cos_threshold=args.collinear_threshold, ratio_threshold=args.collinear_ratio
-            )
-            report["palette"] = []
-            for k in range(len(palette)):
-                rgb_u8 = [int(c) for c in np.round(palette[k])]
-                dist_bg = float(np.linalg.norm(palette[k] - mean_B))
-                d_ink = np.linalg.norm(arr - palette[k], axis=-1)
-                approx_pixels = int(np.sum((d_ink < 30.0) & (fg_dist > tau_low)))
-                report["palette"].append(
-                    {
-                        "index": k + 1,
-                        "hex": rgb_to_hex(palette[k]),
-                        "rgb": rgb_u8,
-                        "dist_from_bg": round(dist_bg, 2),
-                        "approx_core_pixels": approx_pixels,
-                    }
-                )
-            report["collinear_pairs"] = [
-                {
-                    "intermediate_ink": int(m + 1),
-                    "intermediate_hex": rgb_to_hex(palette[m]),
-                    "target_ink": int(k + 1),
-                    "target_hex": rgb_to_hex(palette[k]),
-                    "cosine_similarity": round(cos, 3),
-                    "norm_ratio": round(L_m / L_k, 3),
-                }
-                for m, k, cos, L_m, L_k in collinear_pairs
-            ]
-
-        if args.json:
-            print(json.dumps(report, indent=2))
         else:
-            print("==================================================")
-            print("       KNOCKOUT & UNMIX INSPECTION REPORT         ")
-            print("==================================================")
-            print(f"Image:             {report['image']} ({W}x{H})")
-            print(f"Target Mode:       {mode.upper()} ({'Continuous DTG Unmixing' if mode == 'dtg' else 'Discrete Screenprint Quantization'})")
-            print(f"Background Color:  {report['background']['hex']} RGB {report['background']['rgb']}")
-            print(f"Noise Floor sigma: {report['background']['noise_sigma']} (tau_low = {report['background']['tau_low_used']})")
-            print(f"Max Contrast:      {report['max_contrast_distance']} RGB units")
-            print(f"Est. Foreground:   {report['foreground_pixels_est']:,} px")
-            if "palette" in report:
-                print(f"\nDiscovered / Configured Palette ({len(report['palette'])} Inks):")
-                for p in report["palette"]:
-                    print(f"  Ink {p['index']}: {p['hex']} {p['rgb']} (dist from BG: {p['dist_from_bg']:.1f}, approx core: {p['approx_core_pixels']:,} px)")
-                if report.get("collinear_pairs"):
-                    print("\nCollinear Intermediate Pairs (Rim Suppression Active):")
-                    for cp in report["collinear_pairs"]:
-                        print(f"  Ink {cp['intermediate_ink']} ({cp['intermediate_hex']}) intermediate to Ink {cp['target_ink']} ({cp['target_hex']}) [cos={cp['cosine_similarity']}, ratio={cp['norm_ratio']}]")
-            print("==================================================")
-        return 0
+            img_proc = img_f64.copy()
 
-    # Processing Execution
-    n_colors = len(explicit_palette) if explicit_palette else (args.n_colors or 6)
-    palette = discover_palette(
-        arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, scale_factor=scale_factor, explicit_palette=explicit_palette
-    )
-    rgba, labels, alpha_u8, metrics = assign_and_unmix(
-        arr=arr,
-        B_field=B_field,
-        mean_B=mean_B,
-        palette=palette,
-        mode=mode,
-        tau_low=tau_low,
-        tau_solid=args.tau_solid,
-        alpha_solid=args.alpha_solid,
-        alpha_knee=args.alpha_knee,
-        alpha_power=args.alpha_power,
-        despeckle_size=args.despeckle,
-        collinear_threshold=args.collinear_threshold,
-        collinear_ratio=args.collinear_ratio,
-        verbose=args.verbose,
-    )
+        # Stage 2: Fit continuous background field B(x, y)
+        if args.verbose:
+            print(f"Fitting Stage 2 continuous background field B(x, y) (border_pct={args.border_pct})...")
+        B_field, mean_B, sigma_bg, p99_border_dE = fit_background_field(
+            img_f64,
+            border_pct=args.border_pct,
+            manual_bg_rgb=manual_bg,
+        )
+        bg_hex = rgb_to_hex(mean_B)
 
-    # Determine output file path
-    out_path = args.output
-    if not out_path:
-        stem, _ = os.path.splitext(args.input)
-        out_path = f"{stem}_transparent.png"
+        # Compute CIELAB delta_E
+        delta_E = compute_lab_delta_e(img_proc, B_field)
+        delta_E_raw = compute_lab_delta_e(img_f64, B_field)
 
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    out_img = Image.fromarray(rgba, mode="RGBA")
-    if args.scale > 1:
-        out_img = out_img.resize((W * args.scale, H * args.scale), Image.Resampling.LANCZOS)
-    
-    save_kwargs: Dict[str, Any] = {"optimize": True}
-    if im.info.get("dpi"):
-        save_kwargs["dpi"] = im.info.get("dpi")
-    out_img.save(out_path, **save_kwargs)
+        # Stage 3: Topological Trimap
+        if args.verbose:
+            print(f"Building Stage 3 topological trimap (t_bg={args.bg_thresh}, t_fg={args.fg_thresh}, t_thin={args.thin_thresh})...")
+        trimap, true_bg, valid_cutout_mask, thin_ridges, dist_from_bg, cutout_count = build_topological_trimap(
+            img_proc=img_proc,
+            B_field=B_field,
+            delta_E=delta_E,
+            delta_E_raw=delta_E_raw,
+            t_bg=args.bg_thresh,
+            t_fg=args.fg_thresh,
+            t_thin=args.thin_thresh,
+            unknown_band_px=args.unknown_band_px,
+            min_cutout_area=args.min_cutout_area,
+            protect_interior_boxes=protect_interior_boxes,
+            protect_boxes=protect_boxes,
+            cutout_boxes=cutout_boxes,
+            seal_boxes=seal_boxes,
+            protect_polys=protect_polys,
+        )
 
-    # Preview generation
-    prev_path = None
-    if args.preview is not None:
-        if args.preview == "":
-            stem, _ = os.path.splitext(out_path)
-            prev_path = f"{stem}_preview.png"
+        # Stage 4: Closed-Form Matting + Known-B Unmixing
+        if args.verbose:
+            print("Executing Stage 4 Closed-Form Matting + Two-Stage Known-B Color-Line Unmixing...")
+        F_final, alpha_final, F_init, unmixing_time = run_pymatting_unmixing(
+            img_proc=img_proc,
+            trimap=trimap,
+            B_field=B_field,
+            delta_E=delta_E,
+            t_bg=args.bg_thresh,
+            verbose=args.verbose,
+        )
+
+        # Stage 5: Decoupled Mode Post-Processing
+        explicit_palette = None
+        if args.palette is not None:
+            explicit_palette = [hex_to_rgb_float(h) for h in args.palette.split(",") if h.strip()]
+            if not explicit_palette:
+                raise ValueError("--palette must specify at least one valid hex color")
+
+        F_out, alpha_out, palette_hex = postprocess_mode(
+            F_final=F_final,
+            alpha_final=alpha_final,
+            mode=mode,
+            dtf_alpha_floor=args.dtf_alpha_floor,
+            colors=args.colors,
+            explicit_palette=explicit_palette,
+            verbose=args.verbose,
+        )
+
+        # Save output transparent PNG
+        out_rgba = np.zeros((h_orig, w_orig, 4), dtype=np.uint8)
+        out_rgba[:, :, :3] = (np.clip(F_out, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        out_rgba[:, :, 3] = (np.clip(alpha_out, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        out_pil = Image.fromarray(out_rgba, mode="RGBA")
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        out_pil.save(output_path, dpi=dpi)
+
+    # Stage 6: Prepress Verification Sheet
+    if args.verify_composite:
+        if args.verbose:
+            print(f"Generating 2x2 prepress verification composite sheet: {args.verify_composite}...")
+        generate_verify_composite(F_out, alpha_out, args.verify_composite)
+
+    # Stage 6: 1:1 Native Resolution Diagnostic Crops
+    saved_crops = []
+    if args.verify_crops_dir:
+        if args.verbose:
+            print(f"Selecting and rendering 1:1 native resolution diagnostic crops into {args.verify_crops_dir}...")
+        # Silhouette edge mask
+        alpha_grad_x = cv2.Sobel(alpha_out.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+        alpha_grad_y = cv2.Sobel(alpha_out.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        silhouette_mask = np.sqrt(alpha_grad_x**2 + alpha_grad_y**2)
+
+        if mode == "vector":
+            gray = cv2.cvtColor(img_u8, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            edge_mag = np.sqrt(grad_x**2 + grad_y**2)
+            fine_ridges = (edge_mag > np.percentile(edge_mag, 85)) & (alpha_out > 0.1)
+            unknown_mask = (alpha_out > 0.05) & (alpha_out < 0.95)
+            if np.sum(unknown_mask) < 50:
+                unknown_mask = silhouette_mask > 0.2
+
+            bg_comp = (alpha_out == 0.0).astype(np.uint8)
+            n_lbl, lbls, stats_c, _ = cv2.connectedComponentsWithStats(bg_comp, connectivity=8)
+            valid_cutout_mask = np.zeros_like(alpha_out, dtype=bool)
+            H_c, W_c = alpha_out.shape
+            for l_i in range(1, n_lbl):
+                x, y, w, h, _ = stats_c[l_i]
+                if x > 0 and y > 0 and (x + w) < W_c and (y + h) < H_c:
+                    valid_cutout_mask[lbls == l_i] = True
         else:
-            prev_path = args.preview
-        os.makedirs(os.path.dirname(os.path.abspath(prev_path)), exist_ok=True)
-        prev_img = generate_preview_image(arr, rgba)
-        prev_img.save(prev_path, optimize=True)
+            fine_ridges = thin_ridges & (dist_from_bg <= (args.unknown_band_px + 2.0))
+            unknown_mask = (trimap == 0.5)
 
-    output_report: Dict[str, Any] = {
+        auto_crops = select_diverse_crops(
+            H=h_orig,
+            W=w_orig,
+            thin_ridges=fine_ridges,
+            unknown_mask=unknown_mask,
+            valid_cutouts=valid_cutout_mask,
+            silhouette_mask=silhouette_mask,
+            crop_size=400,
+        )
+
+        manual_crops = [parse_crop_spec(c) for c in args.crop]
+        all_crops = auto_crops + manual_crops
+
+        saved_crops = generate_detail_crops(
+            img_orig_u8=img_u8,
+            F_final=F_out,
+            alpha_final=alpha_out,
+            crops_info=all_crops,
+            output_dir=args.verify_crops_dir,
+        )
+
+    t_total = time.perf_counter() - t_start
+
+    # Compute distribution statistics
+    total_pixels = float(h_orig * w_orig)
+    n_trans = float(np.sum(alpha_out == 0.0))
+    n_solid = float(np.sum(alpha_out == 1.0))
+    n_semi = total_pixels - n_trans - n_solid
+
+    pct_trans = (n_trans / total_pixels) * 100.0
+    pct_semi = (n_semi / total_pixels) * 100.0
+    pct_solid = (n_solid / total_pixels) * 100.0
+
+    summary = {
         "status": "success",
+        "input": args.input,
+        "output": output_path,
+        "svg_output": svg_output_path if mode == "vector" else None,
         "mode": mode,
-        "input_image": os.path.abspath(args.input),
-        "output_png": os.path.abspath(out_path),
-        "preview_png": os.path.abspath(prev_path) if prev_path else None,
-        "background_hex": rgb_to_hex(mean_B),
-        "background_rgb": [float(c) for c in np.round(mean_B, 2)],
-        "tau_low": float(tau_low),
-        "metrics": metrics,
+        "esrgan_model": args.esrgan_model if mode == "vector" else None,
+        "dimensions": [w_orig, h_orig],
+        "dpi": list(dpi),
+        "runtime_seconds": round(t_total, 2),
+        "unmixing_seconds": round(unmixing_time, 2),
+        "background_rgb": [int(round(c * 255.0)) for c in mean_B],
+        "background_hex": bg_hex,
+        "sigma_bg_8bit": round(sigma_bg * 255.0, 2),
+        "p99_border_delta_e": round(p99_border_dE, 2),
+        "cutouts_detected": cutout_count,
+        "alpha_distribution": {
+            "transparent_pct": round(pct_trans, 1),
+            "semi_transparent_pct": round(pct_semi, 1),
+            "solid_opaque_pct": round(pct_solid, 1),
+        },
+        "palette": palette_hex,
+        "verify_composite": args.verify_composite,
+        "verify_crops": saved_crops,
     }
 
-    if mode == "screenprint" and palette is not None and labels is not None:
-        K = len(palette)
-        unique_fg_rgb = np.unique(rgba[alpha_u8 > 0, :3], axis=0)
-        output_report["unique_palette_colors"] = len(unique_fg_rgb)
-        output_report["palette"] = []
-        for k in range(K):
-            k_count = int(np.sum((labels == k) & (alpha_u8 > 0)))
-            output_report["palette"].append(
-                {
-                    "index": k + 1,
-                    "hex": rgb_to_hex(palette[k]),
-                    "rgb": [int(c) for c in np.round(palette[k])],
-                    "pixel_count": k_count,
-                    "share_pct": round(k_count / max(metrics["foreground_pixels"], 1) * 100, 2),
-                }
-            )
-
     if args.json:
-        print(json.dumps(output_report, indent=2))
+        print(json.dumps(summary, indent=2))
     else:
-        print("==================================================")
-        mode_title = "CONTINUOUS DTG BACKGROUND UNMIXING" if mode == "dtg" else "KNOCKOUT & SCREEN-PRINT QUANTIZATION"
-        print(f"    {mode_title} COMPLETE")
-        print("==================================================")
-        print(f"Input:       {args.input}")
-        print(f"Output PNG:  {out_path}")
-        if prev_path:
-            print(f"Preview:     {prev_path}")
-        print(f"Mode:        {mode.upper()} ({'Continuous CMYK+W DTG' if mode == 'dtg' else 'Discrete Screenprint'})")
-        print(f"Background:  {output_report['background_hex']} (tau_low = {tau_low})")
-        print(f"Resolution:  {W}x{H} ({metrics['total_pixels']:,} px)")
-        print(f"Knocked Out: {metrics['transparent_pixels']:,} px ({metrics['transparent_pixels']/metrics['total_pixels']*100:.1f}%)")
-        print(f"Foreground:  {metrics['foreground_pixels']:,} px (Solid: {metrics['opaque_pixels']:,}, Anti-aliased: {metrics['translucent_pixels']:,})")
-        if mode == "screenprint" and "palette" in output_report:
-            print(f"\nDiscrete Screen-Print Palette ({output_report['unique_palette_colors']} Inks Verified):")
-            for p in output_report["palette"]:
-                print(f"  Ink {p['index']}: {p['hex']} {p['rgb']} -> {p['pixel_count']:,} px ({p['share_pct']}%)")
-            print(f"Edge Halo Leaks: {metrics.get('halo_leak_pixels', 0)} (Score: 100% clean)")
-        else:
-            print("\nColor Model: Full 24-bit Continuous RGB with Un-Premultiplied Halo-Free Alpha")
-        print("==================================================")
+        print(f"=== KNOCKOUT QUANTIZE COMPLETE ({t_total:.2f}s) ===")
+        print(f"  Dimensions:        {w_orig}x{h_orig} px @ {dpi[0]} DPI (100% native preserved)")
+        print(f"  Print Mode:        {mode.upper()}" + (" (Spot-Color Unmixing + Cutout Spline VTracer SVG)" if mode == "vector" else ""))
+        if mode == "vector":
+            print(f"  ESRGAN Model:      {args.esrgan_model}")
+            print(f"  Output SVG:        {svg_output_path}")
+        print(f"  Background Field:  {bg_hex} (border sigma: {sigma_bg * 255.0:.2f})")
+        print(f"  Interior Cutouts:  {cutout_count} verified")
+        print(f"  Alpha Matte:       {pct_trans:.1f}% transparent, {pct_semi:.1f}% anti-aliased edge, {pct_solid:.1f}% solid")
+        if palette_hex:
+            print(f"  Spot Palette:      {len(palette_hex)} colors ({', '.join(palette_hex)})")
+        print(f"  Output RGBA:       {output_path}")
+        if args.verify_composite:
+            print(f"  2x2 Prepress Sheet:{args.verify_composite}")
+        if saved_crops:
+            print(f"  1:1 Detail Crops:  {len(saved_crops)} diagnostic strips in {args.verify_crops_dir}")
 
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

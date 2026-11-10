@@ -33,6 +33,7 @@ from scipy.ndimage import (
     sobel,
     maximum_filter,
     label,
+    find_objects,
     uniform_filter,
     grey_dilation,
     median_filter,
@@ -83,11 +84,26 @@ def fit_background_field(
     ys, xs = np.where(border_mask)
     rgb_v = arr[border_mask]
 
-    # Robust outlier rejection on the borders (in case artwork touches edge)
-    med_bg = np.median(rgb_v, axis=0)
-    dev = np.linalg.norm(rgb_v - med_bg, axis=-1)
-    mad = np.median(dev)
-    cutoff = max(15.0, 3.0 * 1.4826 * mad)
+    # Robust mode/histogram-peak background estimation on borders
+    # (prevents foreground artwork touching border from corrupting background)
+    rgb_quant = (np.clip(rgb_v, 0, 255) // 4).astype(np.int32)
+    packed = rgb_quant[:, 0] * 4096 + rgb_quant[:, 1] * 64 + rgb_quant[:, 2]
+    unique_bins, bin_counts = np.unique(packed, return_counts=True)
+    mode_bin = unique_bins[np.argmax(bin_counts)]
+    rough_bg_median = np.median(rgb_v[packed == mode_bin], axis=0)
+
+    # Inlier border pixels within 25.0 RGB units of rough_bg_median
+    dev = np.linalg.norm(rgb_v - rough_bg_median, axis=-1)
+    inliers = dev <= 25.0
+    if np.sum(inliers) >= 30:
+        inlier_pixels = rgb_v[inliers]
+        inlier_dev = np.linalg.norm(inlier_pixels - rough_bg_median, axis=-1)
+        inlier_std = float(np.median(inlier_dev) * 1.4826)
+    else:
+        inlier_std = 2.0
+
+    # Strict cutoff: never exceeds 24.0 so low-contrast foreground (dist >= 35) is never absorbed
+    cutoff = float(np.clip(inlier_std * 3.5 + 10.0, 14.0, 24.0))
     valid_border = dev <= cutoff
 
     ys_v, xs_v = ys[valid_border], xs[valid_border]
@@ -106,7 +122,7 @@ def fit_background_field(
     fitted_border = A @ C_coeffs
     residuals = np.linalg.norm(rgb_valid - fitted_border, axis=-1)
     sigma = float(np.median(residuals) * 1.4826)
-    tau_low = max(6.0, 3.5 * sigma)
+    tau_low = float(np.clip(max(6.0, 3.5 * sigma), 6.0, 16.0))
 
     return B_field, mean_B, sigma, tau_low
 
@@ -117,11 +133,14 @@ def discover_palette(
     mean_B: np.ndarray,
     n_colors: int,
     sigma: float,
+    scale_factor: float = 1.0,
     explicit_palette: Optional[List[List[int]]] = None,
+    min_cluster_ratio: float = 0.0008,
 ) -> np.ndarray:
     """
     Discovers discrete ink colors by clustering pure interior core pixels.
     Snaps each cluster to the exact physical median RGB of its core pixels.
+    Auto-prunes extraneous noise clusters with < 0.08% of core pixels (ALG-04).
     """
     if explicit_palette is not None:
         return np.array(explicit_palette, dtype=np.float32)
@@ -130,9 +149,10 @@ def discover_palette(
     diff = arr - B_field
     dist = np.linalg.norm(diff, axis=-1)
 
-    tau_solid = max(25.0, 5.0 * sigma)
+    tau_solid = max(38.0, 6.0 * sigma)
     solid_mask = dist > tau_solid
-    eroded_solid = binary_erosion(solid_mask, iterations=2)
+    erode_iter = max(1, int(np.round(2 * scale_factor)))
+    eroded_solid = binary_erosion(solid_mask, iterations=erode_iter)
 
     grad_y = sobel(arr, axis=0) / 8.0
     grad_x = sobel(arr, axis=1) / 8.0
@@ -143,21 +163,28 @@ def discover_palette(
 
     if len(core_pixels) < n_colors * 10:
         # Fallback to broader foreground if artwork has very thin lines
-        cand_mask = (dist > tau_solid * 0.7) & (grad_mag < 30.0)
+        cand_mask = (dist > 25.0) & (grad_mag < 30.0)
         core_pixels = arr[cand_mask]
         if len(core_pixels) < n_colors:
-            core_pixels = arr[dist > tau_solid * 0.5]
+            core_pixels = arr[dist > max(15.0, 3.0 * sigma)]
 
     km = KMeans(n_clusters=n_colors, random_state=42, n_init=10).fit(core_pixels)
     labels = km.labels_
+    counts = np.bincount(labels, minlength=n_colors)
+    total_core = len(core_pixels)
 
-    palette = np.zeros((n_colors, 3), dtype=np.float32)
-    for k in range(n_colors):
+    # Auto-prune tiny clusters (< min_cluster_ratio of core pixels, e.g. < 0.08%)
+    min_pixels = max(30, int(total_core * min_cluster_ratio))
+    valid_clusters = [k for k in range(n_colors) if counts[k] >= min_pixels]
+    if len(valid_clusters) == 0:
+        valid_clusters = list(range(n_colors))
+
+    palette_list = []
+    for k in valid_clusters:
         k_mask = labels == k
-        if np.sum(k_mask) > 0:
-            palette[k] = np.median(core_pixels[k_mask], axis=0)
-        else:
-            palette[k] = km.cluster_centers_[k]
+        palette_list.append(np.median(core_pixels[k_mask], axis=0))
+
+    palette = np.array(palette_list, dtype=np.float32)
 
     # Sort palette by Euclidean distance from mean background
     dist_bg = np.linalg.norm(palette - mean_B, axis=-1)
@@ -172,22 +199,37 @@ def find_collinear_pairs(
     mean_B: np.ndarray,
     cos_threshold: float = 0.88,
     ratio_threshold: float = 0.85,
+    max_perp_dist: float = 85.0,
 ) -> List[Tuple[int, int, float, float, float]]:
     """
-    Detects pairs of inks (m, k) where ink m is intermediate and collinear to ink k.
+    Detects pairs of inks (m, k) where ink m is an anti-aliased intermediate rim along the ray to ink k.
+    Requires:
+      1. High cosine similarity (cos > cos_threshold)
+      2. Intermediate length (ratio < ratio_threshold)
+      3. Small perpendicular distance from palette[m] to the line segment (mean_B -> palette[k])
+      4. Positive luminance shift relative to background (anti-aliasing rims of bright inks)
     """
     K = len(palette)
     vecs = palette - mean_B
     norms = np.linalg.norm(vecs, axis=-1)
+    delta_Y = 0.299 * vecs[:, 0] + 0.587 * vecs[:, 1] + 0.114 * vecs[:, 2]
 
     collinear_pairs = []
     for i in range(K):
         for j in range(K):
             if i != j:
+                # Both inks must be brighter than background (rims of bright foreground against darker BG)
+                if delta_Y[i] <= 0 or delta_Y[j] <= 0:
+                    continue
                 dot = np.dot(vecs[i], vecs[j])
                 cos = dot / max(norms[i] * norms[j], 1e-4)
                 if cos > cos_threshold and norms[i] < ratio_threshold * norms[j]:
-                    collinear_pairs.append((i, j, float(cos), float(norms[i]), float(norms[j])))
+                    # Perpendicular distance from palette[i] to the ray (mean_B -> palette[j])
+                    proj = dot / max(norms[j], 1e-4)
+                    perp_sq = max(0.0, norms[i]**2 - proj**2)
+                    perp_dist = float(np.sqrt(perp_sq))
+                    if perp_dist <= max_perp_dist:
+                        collinear_pairs.append((i, j, float(cos), float(norms[i]), float(norms[j])))
     return collinear_pairs
 
 
@@ -219,6 +261,7 @@ def assign_and_unmix(
     5. Pure-Ink Boundary Color: 100% pure uncontaminated palette ink on all boundaries (zero fringe!).
     """
     H, W, _ = arr.shape
+    scale_factor = float(min(H, W)) / 764.0
     diff = arr - B_field
     fg_dist = np.linalg.norm(diff, axis=-1)
 
@@ -228,6 +271,17 @@ def assign_and_unmix(
     K = len(palette)
     vecs = palette - mean_B
     norms = np.linalg.norm(vecs, axis=-1)
+
+    # Compute luminance shift of each ink relative to background
+    # (used for polarity separation to prevent dark foliage from being hijacked by bright snow caps)
+    delta_Y_ink = 0.299 * vecs[:, 0] + 0.587 * vecs[:, 1] + 0.114 * vecs[:, 2]
+    dark_inks = [k for k in range(K) if delta_Y_ink[k] < -10.0]
+    bright_inks = [k for k in range(K) if delta_Y_ink[k] >= -10.0]
+    has_dual_polarity = (len(dark_inks) > 0 and len(bright_inks) > 0)
+
+    # Pixel luminance difference from local background
+    delta_Y_pixel = 0.299 * diff[:, :, 0] + 0.587 * diff[:, :, 1] + 0.114 * diff[:, :, 2]
+    is_dark_pixel = delta_Y_pixel < -6.0
 
     collinear_pairs = find_collinear_pairs(
         palette, mean_B, cos_threshold=collinear_threshold, ratio_threshold=collinear_ratio
@@ -242,8 +296,9 @@ def assign_and_unmix(
     grad_x = sobel(arr, axis=1) / 8.0
     grad_mag = np.sqrt(np.sum(grad_y**2 + grad_x**2, axis=-1))
 
-    # Local 5x5 contrast envelope
-    max_fg_dist_5x5 = maximum_filter(fg_dist, size=5)
+    # Local contrast envelope (scales with resolution)
+    env_size = max(3, int(np.round(5 * scale_factor)) | 1)
+    max_fg_dist_5x5 = maximum_filter(fg_dist, size=env_size)
 
     # Precompute per-ink rays and projections
     V_all = np.zeros((H, W, K, 3), dtype=np.float32)
@@ -260,17 +315,65 @@ def assign_and_unmix(
         alpha_proj_all[:, :, k] = dot / np.maximum(nsq, 1e-6)
         euc_dists_to_inks[:, :, k] = np.linalg.norm(arr_smoothed - palette[k], axis=-1)
 
+    if has_dual_polarity:
+        # Enforce ray-polarity alignment:
+        # Dark pixels cannot match bright inks; bright pixels cannot match dark inks
+        for k in bright_inks:
+            euc_dists_to_inks[:, :, k] = np.where(is_dark_pixel, 1e6, euc_dists_to_inks[:, :, k])
+        for k in dark_inks:
+            euc_dists_to_inks[:, :, k] = np.where(~is_dark_pixel, 1e6, euc_dists_to_inks[:, :, k])
+
     euc_dist_to_bg = np.linalg.norm(arr_smoothed - B_field, axis=-1)
 
     # Stack all Euclidean distances (K inks + 1 background)
     all_entities = np.concatenate([euc_dists_to_inks, euc_dist_to_bg[:, :, None]], axis=-1)
     closest_entity = np.argmin(all_entities, axis=-1)  # 0..K-1: ink, K: background
 
+    fg_mask = fg_dist > tau_low
+    dist_to_bg = distance_transform_edt(fg_mask)
+    thin_boundary_dist = 2.5 * scale_factor
+
     # Map intermediate inks to their higher-contrast counterparts
     intermediate_info: Dict[int, List[Tuple[int, float]]] = {}
     for m, k, cos, L_m, L_k in collinear_pairs:
-        cutoff = L_m + 0.35 * (L_k - L_m)
+        cutoff = L_m + 0.25 * (L_k - L_m)
         intermediate_info.setdefault(m, []).append((k, cutoff))
+
+    # Identify connected components containing higher collinear inks (fixes ALG-01!)
+    fg_lbl, num_fg = label(fg_mask)
+    fg_lbl_flat = fg_lbl.ravel()
+    suppress_m_branches: Dict[int, np.ndarray] = {i: np.zeros((H, W), dtype=bool) for i in range(K)}
+    erode_m = max(1, int(np.round(2.0 * scale_factor)))
+    dilate_m_iter = int(np.round(2.0 * scale_factor))
+
+    # Precompute per-ink wide solids and dilations ONCE
+    m_wide_solid_all: Dict[int, np.ndarray] = {}
+    dilate_m_all: Dict[int, np.ndarray] = {}
+    for m in set(p[0] for p in collinear_pairs):
+        m_wide = binary_erosion(closest_entity == m, iterations=erode_m)
+        m_wide_solid_all[m] = m_wide
+        dilate_m_all[m] = binary_dilation(m_wide, iterations=dilate_m_iter)
+
+    for m, k, cos, L_m, L_k in collinear_pairs:
+        k_candidate_solid = (
+            (closest_entity == k)
+            & (alpha_proj_all[:, :, k] >= 0.70)
+            & (fg_dist >= L_m + 0.20 * (L_k - L_m))
+        )
+        if np.any(k_candidate_solid) and num_fg > 0:
+            k_solid_counts = np.bincount(fg_lbl_flat, weights=k_candidate_solid.ravel(), minlength=num_fg + 1)
+            k_comp_lookup = k_solid_counts > 0
+            k_comp_lookup[0] = False
+
+            m_solid_counts = np.bincount(fg_lbl_flat, weights=m_wide_solid_all[m].ravel(), minlength=num_fg + 1)
+            suppress_entire_lookup = k_comp_lookup & (m_solid_counts == 0)
+            suppress_branch_lookup = k_comp_lookup & (m_solid_counts > 0)
+
+            if np.any(suppress_entire_lookup):
+                suppress_m_branches[m] |= suppress_entire_lookup[fg_lbl]
+            if np.any(suppress_branch_lookup):
+                in_branch_comp = suppress_branch_lookup[fg_lbl]
+                suppress_m_branches[m] |= in_branch_comp & (~dilate_m_all[m]) & (dist_to_bg <= thin_boundary_dist * 1.5)
 
     # =========================================================================
     # Step A: Solid Core Seeding
@@ -280,24 +383,36 @@ def assign_and_unmix(
     # Process inks in descending order of ray length L_k so higher-contrast inks seed first
     ink_order = np.argsort(-norms)
     for k in ink_order:
-        cand = (closest_entity == k) & (alpha_proj_all[:, :, k] >= 0.72) & (fg_dist > tau_low)
+        is_interior = dist_to_bg > thin_boundary_dist
+
+        # For dark inks in dual-polarity images, allow lower contrast floor since L_k is smaller
+        is_dark_k = (k in dark_inks) if has_dual_polarity else False
+        min_proj = 0.60 if is_dark_k else 0.72
+
+        cand_boundary = (~is_interior) & (closest_entity == k) & (alpha_proj_all[:, :, k] >= min_proj) & (fg_dist > tau_low)
+        if has_dual_polarity and (k in dark_inks):
+            # Prevent 1px JPEG dark-undershoot rings right outside bright text from seeding false dark cores
+            cand_boundary &= (grad_mag < 25.0) & (alpha_proj_all[:, :, k] >= 0.80)
+        cand_interior = is_interior & (closest_entity == k)
+        cand = cand_boundary | cand_interior
 
         # Collinear intermediate ink protection on boundary slopes
+        # ONLY apply grad_mag and max_fg_dist suppression near background boundary (~is_interior)
         if k in intermediate_info:
             for higher_k, cutoff in intermediate_info[k]:
-                # Reject if local contrast reaches into higher ink's regime
-                cand &= (max_fg_dist_5x5 <= cutoff)
-                # Reject if on steep anti-aliased edge slope
-                cand &= (grad_mag < 25.0)
+                cand &= (~cand_boundary | (max_fg_dist_5x5 <= cutoff))
+                cand &= (~cand_boundary | (grad_mag < 25.0))
+            if k in suppress_m_branches:
+                cand &= ~suppress_m_branches[k]
 
         core_map[cand] = k
 
-    # Additional suppression: if intermediate ink m is within 2px of higher ink k solid core
+    # Additional suppression: if intermediate ink m is within boundary zone of higher ink k solid core
     for m, k, cos, L_m, L_k in collinear_pairs:
         k_core = (core_map == k)
         if np.any(k_core):
             dist_to_k_core = distance_transform_edt(~k_core)
-            leak = (core_map == m) & (dist_to_k_core <= 2.5) & (max_fg_dist_5x5 > L_m + 0.25 * (L_k - L_m))
+            leak = (core_map == m) & (dist_to_k_core <= thin_boundary_dist) & (max_fg_dist_5x5 > L_m + 0.20 * (L_k - L_m))
             core_map[leak] = -1
 
     # =========================================================================
@@ -306,15 +421,18 @@ def assign_and_unmix(
     fg_islands = (fg_dist > tau_low) & (fg_dist > 10.0)
     lbl, num_features = label(fg_islands)
     if num_features > 0:
-        for c in range(1, num_features + 1):
-            comp_mask = (lbl == c)
-            # If component has no solid core pixel, assign the entire component uniformly
-            if not np.any(core_map[comp_mask] >= 0):
-                dists_in_comp = fg_dist[comp_mask]
+        slices = find_objects(lbl)
+        for c, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            comp_local = (lbl[sl] == c)
+            core_sub = core_map[sl]
+            if not np.any(core_sub[comp_local] >= 0):
+                dists_in_comp = fg_dist[sl][comp_local]
                 peak_idx = int(np.argmax(dists_in_comp))
-                peak_ys, peak_xs = np.where(comp_mask)
+                peak_ys, peak_xs = np.where(comp_local)
                 py, px = peak_ys[peak_idx], peak_xs[peak_idx]
-                peak_diff = arr_smoothed[py, px] - B_field[py, px]
+                peak_diff = arr_smoothed[sl][py, px] - B_field[sl][py, px]
                 norm_p = float(np.linalg.norm(peak_diff))
                 if norm_p > 1e-3:
                     u_peak = peak_diff / norm_p
@@ -323,40 +441,89 @@ def assign_and_unmix(
                         for ik in range(K)
                     ]
                     best_k = int(np.argmax(scores))
-                    core_map[comp_mask] = best_k
+                    core_sub[comp_local] = best_k
 
     # =========================================================================
     # Step B: Nearest-Core Voronoi Propagation
     # =========================================================================
     has_core = (core_map >= 0)
+    propagated_ink = np.zeros((H, W), dtype=np.int32)
     if np.any(has_core):
-        _, (nearest_y, nearest_x) = distance_transform_edt(~has_core, return_indices=True)
-        propagated_ink = core_map[nearest_y, nearest_x]
-    else:
-        propagated_ink = np.zeros((H, W), dtype=np.int32)
+        if has_dual_polarity:
+            has_core_dark = has_core & np.isin(core_map, dark_inks)
+            has_core_bright = has_core & np.isin(core_map, bright_inks)
+            if np.any(has_core_dark) and np.any(has_core_bright):
+                dist_to_dark_core, (ny_d, nx_d) = distance_transform_edt(~has_core_dark, return_indices=True)
+                prop_dark = core_map[ny_d, nx_d]
+
+                _, (ny_b, nx_b) = distance_transform_edt(~has_core_bright, return_indices=True)
+                prop_bright = core_map[ny_b, nx_b]
+
+                use_dark = is_dark_pixel & (dist_to_dark_core <= 3.0 * scale_factor)
+                propagated_ink = np.where(use_dark, prop_dark, prop_bright)
+            else:
+                _, (nearest_y, nearest_x) = distance_transform_edt(~has_core, return_indices=True)
+                propagated_ink = core_map[nearest_y, nearest_x]
+        else:
+            _, (nearest_y, nearest_x) = distance_transform_edt(~has_core, return_indices=True)
+            propagated_ink = core_map[nearest_y, nearest_x]
 
     # Clean edge snap: Any anti-aliased edge pixel assigned to intermediate ink m
-    # that borders higher ink k's solid core snaps to higher ink k
+    # that borders higher ink k's solid core or is on thin branches of k's component snaps to higher ink k
     for m, k, cos, L_m, L_k in collinear_pairs:
         k_core = (core_map == k)
         if np.any(k_core):
             dist_to_k_core = distance_transform_edt(~k_core)
-            edge_leak = (propagated_ink == m) & (dist_to_k_core <= 2.5) & (max_fg_dist_5x5 > L_m + 0.25 * (L_k - L_m))
+            edge_leak = (
+                (propagated_ink == m)
+                & (dist_to_k_core <= thin_boundary_dist)
+                & (max_fg_dist_5x5 > L_m + 0.20 * (L_k - L_m))
+            )
             propagated_ink[edge_leak] = k
+        if m in suppress_m_branches:
+            branch_leak = (propagated_ink == m) & suppress_m_branches[m]
+            propagated_ink[branch_leak] = k
+
+        # Component majority rule (vectorized bincount):
+        if num_fg > 0:
+            k_pix_counts = np.bincount(fg_lbl_flat, weights=(core_map == k).ravel(), minlength=num_fg + 1)
+            m_pix_counts = np.bincount(fg_lbl_flat, weights=(core_map == m).ravel(), minlength=num_fg + 1)
+            majority_k_lookup = (k_pix_counts > m_pix_counts) & (k_pix_counts > 0)
+            majority_k_lookup[0] = False
+            if np.any(majority_k_lookup):
+                in_maj_comp = majority_k_lookup[fg_lbl]
+                thin_tips = in_maj_comp & (propagated_ink == m) & (dist_to_bg <= thin_boundary_dist * 1.5)
+                propagated_ink[thin_tips] = k
 
     assigned_ink_labels = propagated_ink.copy()
 
-    # Morphological despeckling for tiny stray islands in screenprint mode
-    if despeckle_size > 0 and mode == "screenprint":
+    # Morphological despeckling: aspect-ratio and stroke-aware (fixes ALG-02 & ALG-04!)
+    eff_despeckle = int(np.round(despeckle_size * (scale_factor ** 2)))
+    max_speckle_dim = max(4, int(np.round(5 * scale_factor)))
+    if eff_despeckle > 0 and mode == "screenprint":
         small_mask = np.zeros((H, W), dtype=bool)
         for k in range(K):
             k_mask = (assigned_ink_labels == k) & (fg_dist > tau_low)
             lbl_k, n_feat = label(k_mask)
             if n_feat > 0:
-                counts = np.bincount(lbl_k.ravel())
-                small_comps = np.where((counts <= despeckle_size) & (counts > 0))[0]
-                if len(small_comps) > 0:
-                    small_mask |= np.isin(lbl_k, small_comps)
+                counts = np.bincount(lbl_k.ravel(), minlength=n_feat + 1)
+                small_ids = np.where((counts <= eff_despeckle) & (counts > 0))[0]
+                small_ids = small_ids[small_ids > 0]
+                if len(small_ids) > 0:
+                    slices_k = find_objects(lbl_k)
+                    for sc in small_ids:
+                        sl = slices_k[sc - 1]
+                        if sl is None:
+                            continue
+                        h = sl[0].stop - sl[0].start
+                        w = sl[1].stop - sl[1].start
+                        max_dim = max(h, w)
+                        min_dim = max(1, min(h, w))
+                        aspect_ratio = max_dim / min_dim
+                        # Only mark as speckle if compact 2D island; never erase elongated 1D strokes!
+                        if max_dim < max_speckle_dim and aspect_ratio < 2.5:
+                            comp_sc = (lbl_k[sl] == sc)
+                            small_mask[sl][comp_sc] = True
 
         clean_non_small = (fg_dist > tau_low) & (~small_mask)
         if np.any(clean_non_small) and np.any(small_mask):
@@ -375,18 +542,29 @@ def assign_and_unmix(
     alpha_raw = np.clip(dot_diff_V / np.maximum(norm_sq_V, 1e-6), 0.0, 1.0)
 
     # Step D (Part 2): Ridge boost for thin sub-pixel features (snowflakes, filigree)
-    alpha_ridge = maximum_filter(alpha_raw, size=3)
+    ridge_kernel_size = max(3, int(np.round(3 * scale_factor)) | 1)
+    alpha_ridge = maximum_filter(alpha_raw, size=ridge_kernel_size)
     ridge_mask = (alpha_ridge >= 0.35) & (alpha_ridge <= 0.85)
     denom = np.maximum(0.85, alpha_ridge * 1.05)
     alpha_boosted = np.where(ridge_mask, np.clip(alpha_raw / denom, 0.0, 1.0), alpha_raw)
 
-    # Noise gating: contrast-proportional thresholding wipes out JPEG mosquito ringing
-    # around high-contrast text while preserving low-contrast dark strokes
-    tau_mosquito = max(10.0, 3.5 * (mean_B[0] * 0.0 + 1.5))  # adaptive noise floor
-    is_noise = (fg_dist <= tau_mosquito) | (alpha_boosted <= alpha_knee) | (fg_dist <= tau_low)
+    # Adaptive contrast-scaled noise floor and alpha knee (fixes ALG-03!):
+    # Scale mosquito gate proportionally for low-contrast inks (Dark Pine Green, Dark Brown)
+    s_contrast = np.clip((L_k - 60.0) / 90.0, 0.0, 1.0)
+    tau_dark = np.minimum(tau_low, 0.06 * L_k)
+    tau_bright = np.maximum(tau_low, 10.0)
+    tau_ink_adaptive = (1.0 - s_contrast) * tau_dark + s_contrast * tau_bright
+
+    alpha_knee_eff = alpha_knee * np.clip((L_k - 30.0) / 120.0, 0.35, 1.0)
+
+    is_noise = (fg_dist <= tau_ink_adaptive) | (alpha_boosted <= alpha_knee_eff)
 
     # Continuous alpha curve with Hermite knee
-    alpha_norm = np.clip((alpha_boosted - alpha_knee) / (alpha_solid - alpha_knee), 0.0, 1.0)
+    alpha_norm = np.clip(
+        (alpha_boosted - alpha_knee_eff) / np.maximum(alpha_solid - alpha_knee_eff, 1e-4),
+        0.0,
+        1.0,
+    )
     k_knee = np.clip(alpha_norm / 0.15, 0.0, 1.0)
     w_knee = k_knee * k_knee * (3.0 - 2.0 * k_knee)
     alpha_final = np.where(alpha_norm >= 1.0, 1.0, alpha_norm * w_knee)
@@ -395,8 +573,8 @@ def assign_and_unmix(
         alpha_final = alpha_final ** alpha_power
 
     # Interior solid snap: interior pixels with solid projection snap to 100% opacity
-    dist_to_bg = distance_transform_edt(~is_noise)
-    interior_solid = (~is_noise) & (alpha_boosted >= alpha_solid) & (dist_to_bg > 2.0)
+    dist_to_bg_noise = distance_transform_edt(~is_noise)
+    interior_solid = (~is_noise) & (alpha_boosted >= alpha_solid) & (dist_to_bg_noise > 2.0 * scale_factor)
     alpha_final[interior_solid] = 1.0
     alpha_final[is_noise] = 0.0
 
@@ -409,22 +587,27 @@ def assign_and_unmix(
     rgba = np.zeros((H, W, 4), dtype=np.uint8)
     rgba[:, :, 3] = alpha_u8
 
-    # All boundary and translucent pixels MUST use 100% pure uncontaminated palette ink
-    non_solid = (alpha_u8 < 255)
-    dist_to_non_solid = distance_transform_edt(~non_solid)
-    deep_interior = (alpha_u8 == 255) & (dist_to_non_solid > 2.0)
-    boundary_pixels = (alpha_u8 > 0) & (~deep_interior)
+    pure_rgb = np.clip(np.round(assigned_inks), 0, 255).astype(np.float32)
 
-    # Pure uncontaminated palette ink on boundaries
-    rgba[boundary_pixels, :3] = np.clip(np.round(assigned_inks[boundary_pixels]), 0, 255).astype(np.uint8)
-
-    # Deep interior color
     if mode == "dtg":
-        # Continuous smoothed foreground RGB for deep interior
-        rgba[deep_interior, :3] = np.clip(np.round(arr_smoothed[deep_interior]), 0, 255).astype(np.uint8)
+        # Hybrid Pure-Palette Boundary + Continuous Deep Interior:
+        # 1. Boundary pixels, thin strokes, and filigree (dist_to_bg <= 2.5 * scale_factor or alpha_u8 < 255)
+        #    use 100% pure uncontaminated palette ink (pure_rgb), guaranteeing ZERO background fringing
+        #    and 100% crisp solid color on thin strokes (castle lines, pine needles, snowflakes, stars).
+        # 2. Deep interior pixels (dist_to_bg > 2.5 * scale_factor, alpha_u8 == 255, alpha_raw >= 0.90)
+        #    smoothly ramp to continuous arr_smoothed, preserving 100% of inner highlight stripes
+        #    and smooth shading without any quantization or erosion.
+        ramp_start = 2.5 * scale_factor
+        ramp_width = 1.0 * scale_factor
+        w_interior = np.clip((dist_to_bg - ramp_start) / ramp_width, 0.0, 1.0)
+        # Zero interior weight on non-solid or boundary-blended pixels
+        w_interior[(alpha_u8 < 255) | (alpha_raw < 0.90)] = 0.0
+
+        out_rgb = (1.0 - w_interior)[..., None] * pure_rgb + w_interior[..., None] * arr_smoothed
+        rgba[alpha_u8 > 0, :3] = np.clip(np.round(out_rgb[alpha_u8 > 0]), 0, 255).astype(np.uint8)
     else:
-        # Strict discrete palette colors for screenprint
-        rgba[deep_interior, :3] = np.clip(np.round(assigned_inks[deep_interior]), 0, 255).astype(np.uint8)
+        # Strict discrete palette colors for screenprint across all foreground pixels
+        rgba[alpha_u8 > 0, :3] = np.clip(np.round(pure_rgb[alpha_u8 > 0]), 0, 255).astype(np.uint8)
 
     rgba[alpha_u8 == 0, :3] = 0
 
@@ -435,7 +618,12 @@ def assign_and_unmix(
         m_pixels = (assigned_ink_labels == m) & (alpha_u8 > 0)
         if np.any(k_solid) and np.any(m_pixels):
             dist_to_k = distance_transform_edt(~k_solid)
-            halo_leak = np.sum(m_pixels & (dist_to_k <= 2) & (dist_to_bg <= 2) & (max_fg_dist_5x5 > L_m + 0.35 * (L_k - L_m)))
+            halo_leak = np.sum(
+                m_pixels
+                & (dist_to_k <= 2.5 * scale_factor)
+                & (dist_to_bg_noise <= 2.5 * scale_factor)
+                & (max_fg_dist_5x5 > L_m + 0.35 * (L_k - L_m))
+            )
             halo_count += int(halo_leak)
 
     metrics = {
@@ -557,6 +745,8 @@ def main() -> int:
     arr = np.array(im, dtype=np.float32)
     H, W, _ = arr.shape
 
+    scale_factor = float(min(H, W)) / 764.0
+
     manual_bg = hex_to_rgb(args.bg_color) if args.bg_color else None
     B_field, mean_B, sigma, auto_tau_low = fit_background_field(arr, margin_pct=args.margin_pct, manual_bg=manual_bg)
 
@@ -601,7 +791,7 @@ def main() -> int:
         if mode == "screenprint" or args.n_colors or args.palette:
             n_colors = len(explicit_palette) if explicit_palette else (args.n_colors or 4)
             palette = discover_palette(
-                arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, explicit_palette=explicit_palette
+                arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, scale_factor=scale_factor, explicit_palette=explicit_palette
             )
             collinear_pairs = find_collinear_pairs(
                 palette, mean_B, cos_threshold=args.collinear_threshold, ratio_threshold=args.collinear_ratio
@@ -659,7 +849,7 @@ def main() -> int:
     # Processing Execution
     n_colors = len(explicit_palette) if explicit_palette else (args.n_colors or 6)
     palette = discover_palette(
-        arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, explicit_palette=explicit_palette
+        arr, B_field, mean_B, n_colors=n_colors, sigma=sigma, scale_factor=scale_factor, explicit_palette=explicit_palette
     )
     rgba, labels, alpha_u8, metrics = assign_and_unmix(
         arr=arr,

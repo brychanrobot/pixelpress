@@ -1,6 +1,6 @@
 # pixelpress
 
-Production-grade graphic and illustration prepress tools for Antigravity (AGY), featuring Real-ESRGAN 2x super-resolution + Spot-Color Unmixing (Interior Solid CIELAB Guard + Boundary Fractional-Alpha Ray Unmixing with 7x7 Core Support) + $(K+1)$ Cutout Spline VTracer SVG vectorization & canonical hex snapping as the primary workflow, alongside continuous DTG/DTF alpha matting and raster screenprint separation.
+Production-grade graphic and illustration prepress tools for Antigravity (AGY), featuring Real-ESRGAN 2x super-resolution + Spot-Color Unmixing (Topological True-Background Flood-Fill + Interior Solid CIELAB Guard + Pre-VTracer Speckle Consolidation + Internal Seam-Backing Underlay + Boundary Fractional-Alpha Ray Unmixing with 9x9 local core support (4px radius at 2x resolution)) + $(K+1)$ Cutout Spline VTracer SVG vectorization & canonical hex snapping as the primary workflow, alongside continuous DTG/DTF alpha matting and raster screenprint separation.
 
 ---
 
@@ -11,13 +11,17 @@ Production-grade graphic and illustration prepress tools for Antigravity (AGY), 
 ### 1. Vector Prepress Pipeline (`--mode vector`, Primary Default)
 Designed for graphic illustrations, vector-style artwork, cel-shaded art, anime, logos, and typography:
 1. **Real-ESRGAN 2x Super-Resolution & DCT Denoising**: Removes DCT compression blockiness and doubles pixel resolution using `realesrgan-x4plus-anime` or `realesr-animevideov3`.
-2. **Continuous Background Field $B(x, y)$**: Robust 2D degree-2 polynomial surface fitting ($1, x, y, x^2, xy, y^2$) across perimeter garment samples via Iteratively Reweighted Least Squares (IRLS) with Huber loss.
+2. **Continuous Background Field $B(x, y)$**: Robust 2D degree-2 polynomial surface fitting ($1, x, y, x^2, xy, y^2$) across perimeter garment samples via Iteratively Reweighted Least Squares (IRLS) with Huber loss, passed as a continuous spatial field into spot-color unmixing.
 3. **Spot-Color Palette Discovery or Explicit Lock (`--inks`, `--palette`, `--merge-hue-tol`)**: Samples solid foreground interior pixels in CIELAB space with automatic silhouette $K$ selection (default 2..6) and hue consolidation, or locks to an exact comma-separated list of canonical hex colors.
-4. **Two-Zone Spot-Color Unmixing (`unmix_spot_colors`)**:
-   - *Deep Solid Interior (`edt_inside_fg > 3px`)*: Enforces solid opacity ($\alpha = 1.0$) and direct perceptual CIELAB $\Delta E$ matching so interior highlights and stripes never hallucinate background-blended rays.
-   - *Garment Boundary Band (`<= 3px`)*: Fractional-alpha ray unmixing along the directional vector $B \to C_k$ gated by a $7\times 7$ local core support filter (`maximum_filter`), eliminating Gibbs undershoot rims and intermediate transition scabs while preserving delicate 1–2px filigree.
-5. **Flat $(K+1)$ Cutout Spline Vectorization & SVG Cleanup (`clean_vtracer_svg`)**: Traces the clean $(K+1)$ quantized composite via VTracer hierarchical cutout splines (`--colormode color --hierarchical cutout --mode spline --filter_speckle 16`), strips background border `<path>`, `<polygon>`, and `<rect>` elements, enforces XXE/DTD security, snaps every foreground path strictly to its canonical uppercase hex ink, and preserves protected interior regions (`--protect-interior-box`, `--protect-poly`, `--seal-box`).
-6. **300 DPI Transparent PNG & Proofing Suite**: Rasterizes the clean SVG via `resvg` at native print dimensions and generates `2x2` verification composites (`-p`) plus `1:1` native-resolution diagnostic crop strips (`--verify-crops-dir`).
+4. **Topological True-Background Flood-Fill & Two-Zone Spot-Color Unmixing (`unmix_spot_colors`)**:
+   - *Topological True-Background Partitioning (`segment_topological_foreground`)*: Connects candidate background components to identify exterior canvas background and genuine negative-space cutouts ($\text{area} \ge 24$, inscribed radius $\ge 1.5$ px, 25th-percentile $\Delta E \le 20.0$ with palette-relative $\Delta E_{\text{bg}} < \min \Delta E_{\text{ink}}$ dominance).
+   - *Deep Solid Interior (`edt_from_true_bg > 8.0` px at 2x / `4.0` px at 1x)*: Evaluates direct solid perceptual CIELAB distance ($\alpha = 1.0$) across all interior dark outlines, brow/mouth creases, and hat band junctions, guaranteeing zero interior knocked-out pixels.
+   - *Garment Boundary Band (`<= 8.0` px at 2x / `4.0` px at 1x)*: Fractional-alpha ray unmixing along directional vectors $\vec{C}_k - \vec{B}$ gated by a $9\times 9$ local core support filter (`maximum_filter`, 4px radius at 2x resolution), eliminating Gibbs undershoot rims while preserving 1–2px filigree.
+   - *Post-Alpha Topological Pinhole Seal*: Closes any accidental sub-threshold holes not connected to the exterior canvas or valid cutouts.
+5. **Pre-VTracer Speckle Consolidation (`consolidate_raster_speckles`)**: Absorbs small multi-ink transition slivers ($<\text{filter\_speckle}$) into modal adjacent foreground inks before VTracer vectorization, eliminating Swiss-cheese transparent pinholes while keeping freestanding isolated dots intact.
+6. **Flat $(K+1)$ Cutout Spline Vectorization & SVG Cleanup (`clean_vtracer_svg`)**: Traces the clean $(K+1)$ quantized composite via VTracer hierarchical cutout splines, strips background paths/polygons, enforces XXE/DTD security, snaps remaining paths strictly to canonical hex inks, and preserves protected interior regions.
+7. **Internal Seam-Backing Underlay (`inject_seam_backing_underlay`)**: Identifies multi-ink junctions within the safe interior ($\ge 2$ px inset from all transparency), generates canonical darker-ink backing ribbons, traces them with VTracer, and prepends them as underlays in the SVG to eliminate hairline gaps at sharp Bézier boundaries.
+8. **300 DPI Transparent PNG & Proofing Suite**: Rasterizes the clean SVG via `resvg` at native print dimensions and generates `2x2` verification composites (`-p`) plus `1:1` native-resolution diagnostic crop strips (`--verify-crops-dir`).
 
 ### 2. Continuous Raster Prepress Pipeline (`--mode dtg / dtf / screenprint`)
 Designed for continuous-tone or photographic raster artwork:

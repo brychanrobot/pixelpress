@@ -19,7 +19,7 @@ The pipeline provides two distinct processing workflows depending on target prin
                            ├──> Step 1: Real-ESRGAN 2x Upscaling/Denoising
                            ├──> Step 2: Continuous 2D Background Field B(x, y) Fitting
                            ├──> Step 3: Spot-Color Palette Determination (Explicit --palette or Auto-Discovery in CIELAB)
-                           ├──> Step 4: Strict Spot-Color Ray Unmixing & 7x7 Local Core Support (scipy.ndimage.maximum_filter)
+                           ├──> Step 4: Strict Spot-Color Ray Unmixing & 9x9 Local Core Support (scipy.ndimage.maximum_filter)
                            ├──> Step 5: Strictly Flat (K+1)-Color Raster Generation (Exact C_k or B)
                            ├──> Step 6: Cutout Spline VTracer Vectorization (--hierarchical cutout --mode spline --filter_speckle 16)
                            └──> Step 7: Background Path Removal & Canonical Hex Snapping (<= K Spot Inks) + resvg 300 DPI Render
@@ -76,13 +76,14 @@ The pipeline provides two distinct processing workflows depending on target prin
 - **`--mode vector` (Candidate B: Strict Spot-Color Ray Unmixing & `(K+1)`-Palette Quantization -> Cutout Spline VTracer SVG, Primary Default)**:
   Decomposes artwork into discrete spot-color ink channels with exact canonical hexes and zero color fragmentation:
   1. Real-ESRGAN 2x neural denoising and upscaling.
-  2. Spatially varying polynomial background field $B(x, y)$ fitting.
+  2. Spatially varying polynomial background field $B(x, y)$ fitting, passed as continuous 2D field into spot-color unmixing.
   3. Spot-color palette determination: explicit physical inks via `--palette "#RRGGBB,..."` or automatic K-means discovery in CIELAB space (`--inks K`, default 2..6 via silhouette scoring) sampled strictly from high-opacity interior pixels ($\text{dist\_to\_bg} \ge 40.0$ with 2px erosion) and consolidated via `--merge-hue-tol`.
-  4. Directional ray unmixing onto ink vectors $\vec{C}_k - \vec{B}$ with $7\times 7$ local core support dilation (`scipy.ndimage.maximum_filter`), eliminating boundary ringing while preserving $1\text{–}2$px filigree.
-  5. Strictly flat $(K+1)$-color RGB raster generation (exact $\vec{C}_k$ or $\vec{B}$, eliminating edge-snap boolean gravel).
-  6. Cutout spline vectorization via VTracer (`--colormode color --hierarchical cutout --mode spline --filter_speckle 16 --color_precision 8 --corner_threshold 55`).
+  4. Generalized topological true-background flood-fill (`segment_topological_foreground`): partitions canvas into exterior background and genuine negative-space cutouts ($\text{area} \ge 24$, inscribed radius $\ge 1.5$ px, 25th-percentile $\Delta E \le 20.0$ with palette-relative $\Delta E_{\text{bg}} < \min \Delta E_{\text{ink}}$ dominance). Deep solid interior pixels (`edt_from_true_bg > 8.0` px at 2x / `4.0` px at 1x) evaluate direct solid CIELAB distance ($\alpha = 1.0$), while boundary pixels evaluate directional ray unmixing with $9\times 9$ local core support dilation (`scipy.ndimage.maximum_filter`, 4px radius at 2x resolution). Post-alpha topological pinhole seal closes any uninvited interior holes.
+  5. Pre-VTracer raster speckle consolidation (`consolidate_raster_speckles`): absorbs small multi-ink transition slivers ($<\text{filter\_speckle}$) into modal adjacent foreground inks before VTracer vectorization, eliminating Swiss-cheese transparent pinholes while keeping freestanding isolated dots intact.
+  6. Cutout spline vectorization via VTracer (`--colormode color --hierarchical cutout --mode spline --filter_speckle 4 --color_precision 8 --corner_threshold 55`).
   7. Background path removal (paths closer to $B$ than any ink) and exact canonical hex snapping on every remaining path so the output SVG contains at most $K$ exact spot inks.
-  8. Native 1x 300 DPI transparent RGBA render via `resvg_py`.
+  8. Internal seam-backing underlay (`inject_seam_backing_underlay`): identifies multi-ink junctions within the safe interior ($\ge 2$ px inset from all transparency), generates canonical darker-ink backing ribbons, traces them with VTracer, and prepends them as underlays in the SVG to eliminate hairline gaps at sharp Bézier boundaries.
+  9. Native 1x 300 DPI transparent RGBA render via `resvg_py`.
 - **`--mode dtg` (Direct-to-Garment Raster)**:
   Outputs continuous $\vec{F}_{\text{final}}$ and continuous $\alpha_{\text{final}}$ directly with ZERO palette quantization, preserving full 24-bit shading and smooth anti-aliased edges for photographic or continuous-tone artwork.
 - **`--mode dtf` (Direct-to-Film Transfers)**:

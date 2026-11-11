@@ -18,7 +18,7 @@ prepress_vectorize.py - Spot-Color Ray Unmixing & Cutout Spline VTracer SVG + De
 Universal, mathematically rigorous prepress CLI tool for background removal, spot-color unmixing, and vectorization.
 Decomposes illustration artwork into production-grade vector Cutout SVGs or transparent PNGs:
 - Vector Mode (default): Real-ESRGAN (2x) + continuous background field B(x,y)
-  + strict spot-color ray unmixing + 7x7 local core support constraint (scipy.ndimage.maximum_filter)
+  + strict spot-color ray unmixing + 9x9 local core support constraint (4px radius at 2x resolution) (scipy.ndimage.maximum_filter)
   + strictly flat (K+1)-palette quantization + VTracer cutout splines + background path stripping
   + exact canonical hex snapping (<= K spot inks) + clean scalable SVG + resvg 300 DPI RGBA render.
 - Raster Modes (dtg / dtf / screenprint): Edge-preserving chroma smoothing + continuous B(x,y) field
@@ -28,6 +28,7 @@ Decomposes illustration artwork into production-grade vector Cutout SVGs or tran
 """
 
 import argparse
+import copy
 import fcntl
 import hashlib
 import io
@@ -1473,11 +1474,16 @@ def discover_palette(
     4. Merges/consolidates hues within merge_hue_tol in CIELAB and discards background-bleed hues.
     """
     P = img_rgb.astype(np.float32)
-    B = bg_rgb.astype(np.float32)
-    dist_to_bg = np.linalg.norm(P - B.reshape(1, 1, 3), axis=2)
+    if bg_rgb.ndim == 3:
+        B_arr = bg_rgb.astype(np.float32)
+        mean_B = np.mean(B_arr.reshape(-1, 3), axis=0).astype(np.float32)
+        dist_to_bg = np.linalg.norm(P - B_arr, axis=2)
+    else:
+        mean_B = bg_rgb.astype(np.float32)
+        dist_to_bg = np.linalg.norm(P - mean_B.reshape(1, 1, 3), axis=2)
 
-    fg_candidate = (dist_to_bg >= 40.0).astype(np.uint8)
-    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_candidate = (dist_to_bg >= 28.0).astype(np.uint8)
+    k_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     fg_interior = cv2.erode(fg_candidate, k_erode, iterations=1) > 0
 
     if np.sum(fg_interior) < 500:
@@ -1540,6 +1546,11 @@ def discover_palette(
                 best_score = score
                 best_k = k_cand
                 best_km = km_cand
+            elif score >= 0.65 and (best_score - score) <= 0.025 and k_cand > best_k:
+                # Prefer higher K when clustering is strong (score >= 0.65) and within 0.025 of peak,
+                # capturing distinct highlight and shadow tones without under-clustering
+                best_k = k_cand
+                best_km = km_cand
         km = best_km if best_km is not None else KMeans(n_clusters=2, random_state=42, n_init=10).fit(fit_lab)
         cluster_rgbs = []
         for k in range(best_k):
@@ -1551,7 +1562,7 @@ def discover_palette(
                 med_rgb = cv2.cvtColor(med_lab, cv2.COLOR_LAB2RGB).reshape(3) * 255.0
             cluster_rgbs.append(np.clip(med_rgb, 0.0, 255.0).astype(np.float32))
 
-    lab_B = cv2.cvtColor((B / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
+    lab_B = cv2.cvtColor((mean_B / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
     surviving_rgbs = []
     for c_rgb in cluster_rgbs:
         c_lab = cv2.cvtColor((c_rgb / 255.0).reshape(1, 1, 3).astype(np.float32), cv2.COLOR_RGB2LAB)[0, 0]
@@ -1581,11 +1592,315 @@ def discover_palette(
         print(f"Discovered {len(ink_rgbs)} spot inks: {', '.join(canonical_hexes)}")
     return ink_rgbs, canonical_hexes
 
+def segment_topological_foreground(
+    P: np.ndarray,
+    B_arr: np.ndarray,
+    dist_to_bg: np.ndarray,
+    dE_to_bg: np.ndarray,
+    min_dE_to_ink: Optional[np.ndarray] = None,
+    protect_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    cutout_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    protect_polys_2x: Optional[List[np.ndarray]] = None,
+    seal_boxes: Optional[List[Tuple[int, int, int, int, int]]] = None,
+    protect_interior_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
+    alphas: Optional[np.ndarray] = None,
+    residuals: Optional[np.ndarray] = None,
+    dE_solid: Optional[np.ndarray] = None,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generalized Topological True-Background & Deep-Interior Partitioning:
+    1. Defines candidate background pixels via distance and CIELAB delta_E to B_arr,
+       with palette-separated background proof (closer to B than to any foreground ink),
+       and tight linear-mixture cusp pixels near background well-explained by local ink ray projection.
+    2. Runs 8-connected component labeling to separate:
+       - exterior_bg: touching any of the 4 outer canvas borders.
+       - valid_cutouts: genuine negative-space interior holes (either large cutouts with area >= 24,
+         max_edt >= 1.5px, p25_dE <= 20.0 with palette-relative dE_to_bg < min_dE_to_ink dominance,
+         OR palette-separated background dominance with area >= 4, min_dE <= 20.0, and p25_dE + 3.0 < p25_min_ink_dE).
+    3. Defines true_bg = exterior_bg | valid_cutouts.
+    4. Computes deep_interior = distance_transform_edt(~true_bg) > 8.0 px at 2x (4.0 px at 1x).
+    Returns (deep_interior, valid_cutouts, true_bg).
+    """
+    H, W = dist_to_bg.shape
+
+    # 1. Candidate background pixels (palette-separated background proof)
+    if min_dE_to_ink is not None:
+        candidate_bg = (
+            ((dE_to_bg <= 26.0) & (dE_to_bg < min_dE_to_ink))
+            | ((dist_to_bg < 38.0) & (dE_to_bg < 30.0) & (dE_to_bg + 6.0 < min_dE_to_ink))
+        )
+    else:
+        candidate_bg = (dE_to_bg <= 26.0) | (dist_to_bg < 38.0)
+
+    # Tight linear-mixture cusp pixels near background (dist_to_bg < 55.0)
+    # that are well-explained as a mixture of B and a locally present ink C_k
+    # with alpha_k < 0.55 and orthogonal ray residual <= 20.0
+    if alphas is not None and residuals is not None:
+        K = alphas.shape[2]
+        cusp_mixture = np.zeros((H, W), dtype=bool)
+        for k in range(K):
+            if dE_solid is not None:
+                is_solid_k = (dE_solid[:, :, k] <= 18.0) | ((alphas[:, :, k] >= 0.70) & (residuals[:, :, k] <= 18.0))
+            else:
+                is_solid_k = (alphas[:, :, k] >= 0.70) & (residuals[:, :, k] <= 18.0)
+            local_presence_k = scipy.ndimage.maximum_filter(is_solid_k, size=11)
+            cusp_k = (dist_to_bg < 55.0) & (alphas[:, :, k] < 0.55) & (residuals[:, :, k] <= 20.0) & local_presence_k
+            cusp_mixture |= cusp_k
+        candidate_bg |= cusp_mixture
+
+    # Looser threshold inside cutout boxes
+    for cbox in (cutout_boxes_2x or []):
+        cx0, cy0, cx1, cy1 = clamp_box(*cbox, W, H)
+        candidate_bg[cy0:cy1, cx0:cx1] |= (dist_to_bg[cy0:cy1, cx0:cx1] < 38.0)
+
+    # Apply morphological closing to foreground (~candidate_bg) inside seal_boxes
+    for sb in (seal_boxes or []):
+        sx0, sy0, sx1, sy1, r = sb
+        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+        px0, py0 = max(0, sx0 - r), max(0, sy0 - r)
+        px1, py1 = min(W, sx1 + r), min(H, sy1 + r)
+        roi_fg = (~candidate_bg[py0:py1, px0:px1]).astype(np.uint8)
+        k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        closed_roi = cv2.morphologyEx(roi_fg, cv2.MORPH_CLOSE, k_seal)
+        ox0, oy0 = sx0 - px0, sy0 - py0
+        ox1, oy1 = ox0 + (sx1 - sx0), oy0 + (sy1 - sy0)
+        candidate_bg[sy0:sy1, sx0:sx1] &= ~(closed_roi[oy0:oy1, ox0:ox1] > 0)
+
+    # Force background to False inside protected areas
+    for pbox in (protect_boxes_2x or []):
+        px0, py0, px1, py1 = clamp_box(*pbox, W, H)
+        candidate_bg[py0:py1, px0:px1] = False
+
+    for poly in (protect_polys_2x or []):
+        poly_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(poly_mask, [poly], 1)
+        candidate_bg[poly_mask > 0] = False
+
+    # 2. 8-connected component labeling
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidate_bg.astype(np.uint8), connectivity=8
+    )
+
+    exterior_bg = np.zeros((H, W), dtype=bool)
+    valid_cutouts = np.zeros((H, W), dtype=bool)
+
+    for lbl in range(1, num_labels):
+        x = stats[lbl, cv2.CC_STAT_LEFT]
+        y = stats[lbl, cv2.CC_STAT_TOP]
+        w = stats[lbl, cv2.CC_STAT_WIDTH]
+        h = stats[lbl, cv2.CC_STAT_HEIGHT]
+        area = stats[lbl, cv2.CC_STAT_AREA]
+
+        touches_border = (x == 0) or (y == 0) or (x + w >= W) or (y + h >= H)
+        if touches_border:
+            exterior_bg[y:y+h, x:x+w] |= (labels[y:y+h, x:x+w] == lbl)
+        else:
+            # Interior component NOT touching the border
+            # Check if suppressed by protect_interior_boxes_2x
+            in_protect_interior = False
+            for pibox in (protect_interior_boxes_2x or []):
+                bx0, by0, bx1, by1 = clamp_box(*pibox, W, H)
+                if not (x + w <= bx0 or x >= bx1 or y + h <= by0 or y >= by1):
+                    if np.any(labels[max(y, by0):min(y+h, by1), max(x, bx0):min(x+w, bx1)] == lbl):
+                        in_protect_interior = True
+                        break
+            if in_protect_interior:
+                continue
+
+            # Check if suppressed by seal_boxes
+            in_seal_box = False
+            for sb in (seal_boxes or []):
+                sx0, sy0, sx1, sy1, _ = sb
+                bx0, by0, bx1, by1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
+                if not (x + w <= bx0 or x >= bx1 or y + h <= by0 or y >= by1):
+                    if np.any(labels[max(y, by0):min(y+h, by1), max(x, bx0):min(x+w, bx1)] == lbl):
+                        in_seal_box = True
+                        break
+            if in_seal_box:
+                continue
+
+            # Check if in cutout_boxes_2x
+            is_in_cutout_box = False
+            for cbox in (cutout_boxes_2x or []):
+                cx0, cy0, cx1, cy1 = clamp_box(*cbox, W, H)
+                if not (x + w <= cx0 or x >= cx1 or y + h <= cy0 or y >= cy1):
+                    if np.any(labels[max(y, cy0):min(y+h, cy1), max(x, cx0):min(x+w, cx1)] == lbl):
+                        is_in_cutout_box = True
+                        break
+
+            if area < 4:
+                continue
+
+            comp_slice = (labels[y:y+h, x:x+w] == lbl)
+            comp_dE = dE_to_bg[y:y+h, x:x+w][comp_slice]
+            min_dE = float(np.min(comp_dE))
+            p25_dE = float(np.percentile(comp_dE, 25))
+
+            comp_edt = scipy.ndimage.distance_transform_edt(comp_slice)
+            max_edt = float(np.max(comp_edt))
+
+            if min_dE_to_ink is not None:
+                comp_ink_dE = min_dE_to_ink[y:y+h, x:x+w][comp_slice]
+                p25_ink_dE = float(np.percentile(comp_ink_dE, 25))
+            else:
+                p25_ink_dE = 1e6
+
+            # 1. Large cutout rule (must be closer to background than to any ink)
+            min_area = 6 if is_in_cutout_box else 24
+            max_p25 = 22.0 if is_in_cutout_box else 20.0
+            is_large_cutout = (area >= min_area) and (max_edt >= 1.5) and (p25_dE <= max_p25) and (p25_dE < p25_ink_dE)
+
+            # 2. High-confidence small cutout rule
+            is_small_cutout = (area >= 12) and (p25_dE <= 20.0) and (p25_dE + 3.0 < p25_ink_dE)
+
+            # 3. Palette-separated background dominance rule (small genuine negative-space pockets)
+            is_bg_dominant = (area >= 4) and (min_dE <= 20.0) and (p25_dE + 3.0 < p25_ink_dE)
+
+            if not (is_large_cutout or is_small_cutout or is_bg_dominant):
+                continue
+
+            valid_cutouts[y:y+h, x:x+w] |= comp_slice
+            if verbose:
+                print(f"        Cutout component {lbl}: at x={x}, y={y}, w={w}, h={h}, area={area}, p25_dE={p25_dE:.1f}")
+
+    true_bg = exterior_bg | valid_cutouts
+    edt_from_true_bg = scipy.ndimage.distance_transform_edt(~true_bg)
+    deep_interior = edt_from_true_bg > 8.0
+
+    if verbose:
+        n_cutout_lbls = len(np.unique(labels[valid_cutouts]))
+        print(f"    Topological Partitioning: exterior_bg={int(np.sum(exterior_bg))} px, "
+              f"valid_cutouts={int(np.sum(valid_cutouts))} px ({n_cutout_lbls} components), "
+              f"deep_interior={int(np.sum(deep_interior))} px")
+
+    return deep_interior, valid_cutouts, true_bg
+
+
+def consolidate_low_gradient_voronoi_splits(
+    k_star: np.ndarray,
+    fg_mask: np.ndarray,
+    P_lab: np.ndarray,
+    ink_rgbs: List[np.ndarray],
+    max_dE_pair: float = 28.0,
+    max_p75_grad: float = 4.5,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Generalized Low-Gradient Voronoi Split Consolidation:
+    Eliminates two-tone camouflage blotching on smoothly shaded regions (e.g. spheres, cones, cheeks)
+    while strictly preserving crisp cel-shaded drawn edges (hat cheek shadow, bevels, stripes, stars).
+
+    When an ink component of k1 inside fg_mask shares a boundary with neighbor ink k2
+    where dE(C_k1, C_k2) < max_dE_pair:
+    Measures the 75th-percentile step-edge gradient in unquantized P_lab across their shared boundary.
+    - Genuine cel-shaded art boundaries have a crisp drawn edge (p75 >= 6.0 CIELAB units).
+    - False camouflage blotches cross a smooth gradient without a step edge (p75 < 4.5 CIELAB units).
+    Any component meeting a neighbor across a low-gradient boundary merges into the dominant neighbor.
+    """
+    K = len(ink_rgbs)
+    if K < 2 or not np.any(fg_mask):
+        return k_star
+
+    k_out = k_star.copy()
+    H, W = k_star.shape
+
+    # Precompute pairwise CIELAB distances between inks
+    ink_labs = [
+        cv2.cvtColor(
+            np.clip(ink_rgbs[k] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32),
+            cv2.COLOR_RGB2LAB
+        )[0, 0]
+        for k in range(K)
+    ]
+    pair_dE = np.zeros((K, K), dtype=np.float32)
+    for i in range(K):
+        for j in range(K):
+            pair_dE[i, j] = float(np.linalg.norm(ink_labs[i] - ink_labs[j]))
+
+    # Step-edge difference magnitude in unquantized P_lab
+    diff_x = np.zeros((H, W), dtype=np.float32)
+    diff_y = np.zeros((H, W), dtype=np.float32)
+    diff_x[:, :-1] = np.linalg.norm(P_lab[:, 1:, :] - P_lab[:, :-1, :], axis=2)
+    diff_y[:-1, :] = np.linalg.norm(P_lab[1:, :, :] - P_lab[:-1, :, :], axis=2)
+    grad_mag = np.maximum(diff_x, diff_y)
+
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+    total_merged = 0
+    for pass_idx in range(2):
+        pass_merged = 0
+        unique_inks = np.unique(k_out[fg_mask])
+        for k1 in unique_inks:
+            mask_k1 = fg_mask & (k_out == k1)
+            if not np.any(mask_k1):
+                continue
+
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                mask_k1.astype(np.uint8), connectivity=8
+            )
+
+            for lbl in range(1, num_labels):
+                area = stats[lbl, cv2.CC_STAT_AREA]
+                x = stats[lbl, cv2.CC_STAT_LEFT]
+                y = stats[lbl, cv2.CC_STAT_TOP]
+                w = stats[lbl, cv2.CC_STAT_WIDTH]
+                h = stats[lbl, cv2.CC_STAT_HEIGHT]
+
+                px0, py0 = max(0, x - 1), max(0, y - 1)
+                px1, py1 = min(W, x + w + 1), min(H, y + h + 1)
+
+                comp_local = (labels[py0:py1, px0:px1] == lbl)
+                dilated_local = cv2.dilate(comp_local.astype(np.uint8), k_dil) > 0
+                boundary_band = dilated_local & (~comp_local) & fg_mask[py0:py1, px0:px1]
+
+                if not np.any(boundary_band):
+                    continue
+
+                neighbor_inks = k_out[py0:py1, px0:px1][boundary_band]
+                unique_neighbors = np.unique(neighbor_inks)
+
+                best_target_k = None
+                best_contact = 0
+
+                for k2 in unique_neighbors:
+                    if k2 == k1 or pair_dE[k1, k2] >= max_dE_pair:
+                        continue
+
+                    k2_boundary = boundary_band & (k_out[py0:py1, px0:px1] == k2)
+                    contact_size = int(np.sum(k2_boundary))
+                    if contact_size < 2:
+                        continue
+
+                    # Gradient across the shared boundary
+                    grad_vals = grad_mag[py0:py1, px0:px1][k2_boundary]
+                    p75_grad = float(np.percentile(grad_vals, 75))
+
+                    if p75_grad < max_p75_grad:
+                        if contact_size > best_contact:
+                            best_contact = contact_size
+                            best_target_k = k2
+
+                if best_target_k is not None:
+                    k_out[py0:py1, px0:px1][comp_local] = best_target_k
+                    pass_merged += area
+
+        total_merged += pass_merged
+        if pass_merged == 0:
+            break
+
+    if verbose and total_merged > 0:
+        print(f"    Low-Gradient Voronoi Consolidation: merged {total_merged} smooth shading pixels across low-gradient boundaries")
+
+    return k_out
+
 
 def unmix_spot_colors(
     P: np.ndarray,
     B: np.ndarray,
     ink_rgbs: List[np.ndarray],
+    bg_flat_rgb: Optional[np.ndarray] = None,
+    protect_interior_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
     protect_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
     cutout_boxes_2x: Optional[List[Tuple[int, int, int, int]]] = None,
     protect_polys_2x: Optional[List[np.ndarray]] = None,
@@ -1593,36 +1908,45 @@ def unmix_spot_colors(
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Strict Spot-Color Ray Unmixing + Interior Solid CIELAB Guard + 7x7 Local Core Support:
-    1. Projects P - B onto each ink ray C_k - B for boundary anti-aliased mixture pixels.
-    2. Computes foreground core distance (EDT on CIELAB delta_E > 18.0 & alpha > 0.75).
-    3. Deep interior pixels (> 3px inside foreground) evaluate direct solid CIELAB distance (alpha = 1.0)
-       to each palette ink C_k, preventing interior highlights/gradients from matching fractional background rays.
-    4. Enforces 7x7 local core support constraint via scipy.ndimage.maximum_filter.
-    5. Builds the strictly flat (K+1)-color RGB raster for VTracer spline vectorization.
+    Strict Spot-Color Ray Unmixing + Generalized Topological True-Background & Deep-Interior Guard + 9x9 Local Core Support (4px radius at 2x resolution):
+    1. Supports spatially varying B field ((H, W, 3)) or uniform B vector ((3,)).
+    2. Projects P - B onto each ink ray C_k - B for boundary anti-aliased mixture pixels.
+    3. Partitions canvas topologically via segment_topological_foreground:
+       - Exterior canvas background & valid negative-space cutouts form true_bg.
+       - Pixels > 8.0px (4.0px at 1x) from true_bg form deep_interior: evaluated directly by perceptual solid CIELAB distance (alpha = 1.0).
+    4. Enforces 9x9 local core support constraint (4px radius at 2x resolution) on transition boundaries to eliminate rogue color halos.
+    5. Post-alpha topological pinhole seal guarantees zero accidental sub-threshold holes inside solid art.
+    6. Builds the strictly flat (K+1)-color RGB raster for VTracer spline vectorization.
     """
     K = len(ink_rgbs)
     H, W, _ = P.shape
 
-    C_minus_B = []
-    norm_sq = []
-    for Ck in ink_rgbs:
-        diff = Ck - B
-        C_minus_B.append(diff)
-        norm_sq.append(float(np.dot(diff, diff) + 1e-6))
+    if B.ndim == 1:
+        B_arr = B.reshape(1, 1, 3).astype(np.float32)
+        mean_B = B.astype(np.float32)
+    elif B.ndim == 2:
+        B_arr = B.reshape(1, -1, 3).astype(np.float32)
+        mean_B = np.mean(B_arr.reshape(-1, 3), axis=0).astype(np.float32)
+    else:
+        B_arr = B.astype(np.float32)
+        mean_B = np.mean(B_arr.reshape(-1, 3), axis=0).astype(np.float32)
 
-    P_minus_B = P - B.reshape(1, 1, 3)
+    if bg_flat_rgb is None:
+        bg_flat_rgb = mean_B
+
+    P_minus_B = P - B_arr
     dist_to_bg = np.linalg.norm(P_minus_B, axis=2)
 
     alphas = []
     residuals = []
     dots = []
     for k in range(K):
-        diff = C_minus_B[k].reshape(1, 1, 3)
-        dot = np.sum(P_minus_B * diff, axis=2)
-        dots.append(dot)
-        a_k = np.clip(dot / norm_sq[k], 0.0, 1.0)
-        P_hat = B.reshape(1, 1, 3) + a_k[:, :, None] * diff
+        diff_k = ink_rgbs[k].reshape(1, 1, 3) - B_arr
+        norm_sq_k = np.sum(diff_k * diff_k, axis=2) + 1e-6
+        dot_k = np.sum(P_minus_B * diff_k, axis=2)
+        dots.append(dot_k)
+        a_k = np.clip(dot_k / norm_sq_k, 0.0, 1.0)
+        P_hat = B_arr + a_k[:, :, None] * diff_k
         res = np.linalg.norm(P - P_hat, axis=2)
         alphas.append(a_k)
         residuals.append(res)
@@ -1633,90 +1957,161 @@ def unmix_spot_colors(
     raw_scores = residuals / (alphas + 0.15)
 
     # Convert P and B to CIELAB for perceptual color distance metrics
+    P_u8 = np.clip(np.round(P), 0, 255).astype(np.uint8)
+    P_smooth_u8 = cv2.bilateralFilter(P_u8, d=9, sigmaColor=18.0, sigmaSpace=7.0)
+    P_smooth_norm = P_smooth_u8.astype(np.float32) / 255.0
+    P_smooth_lab = cv2.cvtColor(P_smooth_norm, cv2.COLOR_RGB2LAB)
+
     P_norm = np.clip(P / 255.0, 0.0, 1.0).astype(np.float32)
     P_lab = cv2.cvtColor(P_norm, cv2.COLOR_RGB2LAB)
-    B_norm = np.clip(B / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
-    B_lab = cv2.cvtColor(B_norm, cv2.COLOR_RGB2LAB)[0, 0]
-    dE_to_bg = np.linalg.norm(P_lab - B_lab.reshape(1, 1, 3), axis=2)
+    if B_arr.shape[:2] == (1, 1):
+        B_norm = np.clip(mean_B / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
+        B_lab = cv2.cvtColor(B_norm, cv2.COLOR_RGB2LAB)[0, 0].reshape(1, 1, 3)
+    else:
+        B_norm = np.clip(B_arr / 255.0, 0.0, 1.0).astype(np.float32)
+        B_lab = cv2.cvtColor(B_norm, cv2.COLOR_RGB2LAB)
 
-    # Compute foreground core distance via Euclidean Distance Transform (EDT)
-    # on initial foreground pixels far from bg_rgb (CIELAB delta_E > 18.0 and raw ray alpha > 0.75)
-    max_alpha = np.max(alphas, axis=2)
-    initial_fg = (dE_to_bg > 18.0) & (max_alpha > 0.75)
-    for pbox in (protect_boxes_2x or []):
-        px0, py0, px1, py1 = clamp_box(*pbox, W, H)
-        initial_fg[py0:py1, px0:px1] = True
-    for poly in (protect_polys_2x or []):
-        poly_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillPoly(poly_mask, [poly], 1)
-        initial_fg[poly_mask > 0] = True
-    for cbox in (cutout_boxes_2x or []):
-        cx0, cy0, cx1, cy1 = clamp_box(*cbox, W, H)
-        initial_fg[cy0:cy1, cx0:cx1] = False
-    for sb in (seal_boxes or []):
-        sx0, sy0, sx1, sy1, r = sb
-        sx0, sy0, sx1, sy1 = clamp_box(sx0, sy0, sx1, sy1, W, H)
-        px0, py0 = max(0, sx0 - r), max(0, sy0 - r)
-        px1, py1 = min(W, sx1 + r), min(H, sy1 + r)
-        roi = initial_fg[py0:py1, px0:px1].astype(np.uint8)
-        k_seal = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        closed_roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k_seal)
-        ox0, oy0 = sx0 - px0, sy0 - py0
-        ox1, oy1 = ox0 + (sx1 - sx0), oy0 + (sy1 - sy0)
-        initial_fg[sy0:sy1, sx0:sx1] |= (closed_roi[oy0:oy1, ox0:ox1] > 0)
+    dE_to_bg = np.linalg.norm(P_lab - B_lab, axis=2)
 
-    edt_inside_fg = scipy.ndimage.distance_transform_edt(initial_fg)
-    deep_interior = edt_inside_fg > 3.0
+    # Compute CIELAB distance from every pixel to every candidate ink C_k using edge-preserving smoothed lab
+    dE_solid = np.zeros((H, W, K), dtype=np.float32)
+    for k in range(K):
+        Ck_norm = np.clip(ink_rgbs[k] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
+        Ck_lab = cv2.cvtColor(Ck_norm, cv2.COLOR_RGB2LAB)[0, 0]
+        dE_solid[:, :, k] = np.linalg.norm(P_smooth_lab - Ck_lab.reshape(1, 1, 3), axis=2)
+    min_dE_to_ink = np.min(dE_solid, axis=2)
 
-    # For deep interior pixels (> 3px away from background/transition), evaluate direct
+    # Topological True-Background & Deep-Interior Partitioning
+    deep_interior, valid_cutouts, true_bg = segment_topological_foreground(
+        P=P,
+        B_arr=B_arr,
+        dist_to_bg=dist_to_bg,
+        dE_to_bg=dE_to_bg,
+        min_dE_to_ink=min_dE_to_ink,
+        protect_boxes_2x=protect_boxes_2x,
+        cutout_boxes_2x=cutout_boxes_2x,
+        protect_polys_2x=protect_polys_2x,
+        seal_boxes=seal_boxes,
+        protect_interior_boxes_2x=protect_interior_boxes_2x,
+        alphas=alphas,
+        residuals=residuals,
+        dE_solid=dE_solid,
+        verbose=verbose,
+    )
+    edt_from_true_bg = scipy.ndimage.distance_transform_edt(~true_bg)
+
+    # For deep interior pixels (> 8px away from true_bg), evaluate direct
     # solid CIELAB distance (alpha = 1.0) to each palette ink C_k instead of fractional
-    # background-blended ray projection, preventing interior gradients/highlights from
-    # erroneously matching background-blended rays of a wrong third ink.
+    # background-blended ray projection.
     if np.any(deep_interior):
-        dE_solid = np.zeros((H, W, K), dtype=np.float32)
-        for k in range(K):
-            Ck_norm = np.clip(ink_rgbs[k] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32)
-            Ck_lab = cv2.cvtColor(Ck_norm, cv2.COLOR_RGB2LAB)[0, 0]
-            dE_solid[:, :, k] = np.linalg.norm(P_lab - Ck_lab.reshape(1, 1, 3), axis=2)
-
         raw_scores[deep_interior] = dE_solid[deep_interior]
         alphas[deep_interior] = 1.0
         dots[deep_interior] = np.maximum(dots[deep_interior], 1.0)
         if verbose:
             print(f"    Interior Solid CIELAB Guard: {int(np.sum(deep_interior))} solid interior pixels evaluated directly")
 
-    # Local Core Support Constraint:
-    # 1. Determine unconstrained interior winner
+    # Local Core Support Constraint (Universal Spatial + Extremum Core Support):
+    # 1. Determine unconstrained winner
     k_raw = np.argmin(raw_scores, axis=2)
     best_raw_alpha = np.take_along_axis(alphas, k_raw[:, :, None], axis=2).squeeze(2)
 
-    # 2. Define true core presence of ink k
+    # 2. Local 3x3 luminance extrema in P_lab
+    P_L = P_lab[:, :, 0]
+    P_L_max3 = scipy.ndimage.maximum_filter(P_L, size=3)
+    P_L_min3 = scipy.ndimage.minimum_filter(P_L, size=3)
+
+    # 3. Define true physical core presence of ink k:
+    # A pixel qualifies as a genuine core ONLY if (k_raw == k) & (alpha >= 0.78) & (dE_to_bg >= 22.0 | deep_interior)
+    # AND EITHER:
+    # a) It survives a 3x3 morphological erosion (genuine solid region >= 3x3), OR
+    # b) It is a genuine 1D luminance ridge/valley stroke (NOT a monotonic slope between two inks or background!):
+    #    - for a bright thin stroke (is_brightest): P_L >= maximum_filter(P_L, 3) - 1.2, dE_solid <= 8.0, area(k_raw == k) >= 10 px
+    #    - for a dark thin stroke (is_darkest): P_L <= minimum_filter(P_L, 3) + 1.2, dE_solid <= 10.0, edt_from_true_bg > 4.0, area(k_raw == k) >= 10 px
+    k_erode3 = np.ones((3, 3), np.uint8)
     is_core = np.zeros((H, W, K), dtype=bool)
     for k in range(K):
-        is_core[:, :, k] = (k_raw == k) & (best_raw_alpha >= 0.70) & ((dist_to_bg >= 28.0) | deep_interior)
+        base_core_k = (
+            (k_raw == k)
+            & (best_raw_alpha >= 0.78)
+            & ((dE_to_bg >= 22.0) | deep_interior)
+            & (dE_solid[:, :, k] <= 18.0)
+        )
+        survives_erode = cv2.erode(base_core_k.astype(np.uint8), k_erode3) > 0
 
-    # 3. Dilate is_core by 7x7 window (radius = 3px at 2x ESRGAN resolution)
+        # Connected component area of (k_raw == k) >= 10 px
+        mask_k = (k_raw == k)
+        num_lbl_k, lbls_k, stats_k, _ = cv2.connectedComponentsWithStats(
+            mask_k.astype(np.uint8), connectivity=8
+        )
+        if num_lbl_k > 1:
+            comp_area_ge_10 = (lbls_k > 0) & (stats_k[lbls_k, cv2.CC_STAT_AREA] >= 10)
+        else:
+            comp_area_ge_10 = np.zeros((H, W), dtype=bool)
+
+        is_brightest = (
+            (P_L >= P_L_max3 - 1.2)
+            & (dE_solid[:, :, k] <= 8.0)
+            & comp_area_ge_10
+        )
+        is_darkest = (
+            (P_L <= P_L_min3 + 1.2)
+            & (dE_solid[:, :, k] <= 10.0)
+            & (edt_from_true_bg > 4.0)
+            & comp_area_ge_10
+        )
+        is_extremum = is_brightest | is_darkest
+        is_core[:, :, k] = base_core_k & (survives_erode | is_extremum)
+
+    # 4. Dilate is_core by 9x9 window (radius = 4px at 2x ESRGAN resolution)
+    # Covering anti-aliased transition ramps without bleeding across neighboring features
     supported_mask = np.zeros((H, W, K), dtype=bool)
     for k in range(K):
-        supported_mask[:, :, k] = scipy.ndimage.maximum_filter(is_core[:, :, k], size=7)
+        supported_mask[:, :, k] = scipy.ndimage.maximum_filter(is_core[:, :, k], size=9)
+
+    # 4b. Single-Ink Component Core Propagation:
+    # For isolated foreground strokes/components (e.g. pine fronds, trees, stars, filigree),
+    # if a connected foreground component has genuine solid core support from EXACTLY ONE ink,
+    # that ink's support propagates across the entire component, preventing thin tapered extremities
+    # from being hijacked by unconstrained alien inks.
+    fg_stroke_cand = (~true_bg) & ((dist_to_bg >= 22.0) | deep_interior)
+    num_fg_cc, fg_cc_labels, fg_cc_stats, _ = cv2.connectedComponentsWithStats(
+        fg_stroke_cand.astype(np.uint8), connectivity=8
+    )
+    for lbl in range(1, num_fg_cc):
+        area = fg_cc_stats[lbl, cv2.CC_STAT_AREA]
+        if area < 4:
+            continue
+        comp_mask = (fg_cc_labels == lbl)
+        comp_core_inks = [k for k in range(K) if np.any(is_core[comp_mask, k])]
+        if len(comp_core_inks) == 1:
+            single_k = comp_core_inks[0]
+            supported_mask[comp_mask, single_k] = True
 
     any_supported = np.any(supported_mask, axis=2)
 
-    # 4. For boundary/anti-aliased pixels with at least one supported ink, penalize unsupported inks
+    # 5. Universal core support penalty across BOTH boundary and deep interior
     scores = raw_scores.copy()
-    mask_to_penalize = (~deep_interior[:, :, None]) & any_supported[:, :, None] & (~supported_mask)
+    mask_to_penalize = any_supported[:, :, None] & (~supported_mask)
     scores[mask_to_penalize] = 1e6
 
-    # 5. Pick winning ink
+    # 6. Pick winning ink
     k_star = np.argmin(scores, axis=2)
     best_alpha = np.take_along_axis(alphas, k_star[:, :, None], axis=2).squeeze(2)
     best_dot = np.take_along_axis(dots, k_star[:, :, None], axis=2).squeeze(2)
 
-    # 6. Continuous alpha ramp, tightened against Gibbs ringing
+    # 7. Continuous alpha ramp, tightened against Gibbs ringing
     clean_alpha = np.clip((best_alpha - 0.25) / (0.80 - 0.25), 0.0, 1.0)
     clean_alpha[dist_to_bg < 22.0] = 0.0
-    clean_alpha[best_dot <= 0] = 0.0
+    bg_dominant_near_edge = (edt_from_true_bg <= 6.0) & (dist_to_bg < 38.0) & (dE_to_bg + 4.0 < min_dE_to_ink)
+    clean_alpha[bg_dominant_near_edge] = 0.0
+
+    # Ensure best_dot <= 0 ONLY applies in near_bg (edt <= 6.0 and dE_to_bg <= 22.0)
+    # so thin foreground highlights near dark outlines (like hat brim edge) are NEVER zeroed out into holes
+    near_bg_hole_guard = (edt_from_true_bg <= 6.0) & (dE_to_bg <= 22.0)
+    clean_alpha[(best_dot <= 0) & near_bg_hole_guard] = 0.0
+
     clean_alpha[deep_interior] = 1.0
+    clean_alpha[valid_cutouts] = 0.0
 
     # Apply ROI overrides
     for pbox in (protect_boxes_2x or []):
@@ -1733,15 +2128,304 @@ def unmix_spot_colors(
         box_d = dist_to_bg[cy0:cy1, cx0:cx1]
         clean_alpha[cy0:cy1, cx0:cx1][box_d < 38.0] = 0.0
 
+    # Post-Alpha Topological Pinhole Seal (Palette-Relative Background Proof)
+    fg_mask = clean_alpha >= 0.50
+    bg_mask = ~fg_mask
+    n_bg_lbl, bg_lbls, bg_stats, _ = cv2.connectedComponentsWithStats(bg_mask.astype(np.uint8), connectivity=8)
+    sealed_pinholes = 0
+    for b_lbl in range(1, n_bg_lbl):
+        bx = bg_stats[b_lbl, cv2.CC_STAT_LEFT]
+        by = bg_stats[b_lbl, cv2.CC_STAT_TOP]
+        bw = bg_stats[b_lbl, cv2.CC_STAT_WIDTH]
+        bh = bg_stats[b_lbl, cv2.CC_STAT_HEIGHT]
+        b_touches_border = (bx == 0) or (by == 0) or (bx + bw >= W) or (by + bh >= H)
+        if b_touches_border:
+            continue
+        b_comp_mask = (bg_lbls[by:by+bh, bx:bx+bw] == b_lbl)
+        overlaps_cutout = np.any(valid_cutouts[by:by+bh, bx:bx+bw] & b_comp_mask)
+        if overlaps_cutout:
+            continue
+
+        comp_edt = edt_from_true_bg[by:by+bh, bx:bx+bw][b_comp_mask]
+        min_comp_edt = float(np.min(comp_edt))
+        # NEVER seal boundary anti-aliased ramp pixels into opaque brown!
+        if min_comp_edt <= 6.0:
+            continue
+
+        comp_dE_bg = dE_to_bg[by:by+bh, bx:bx+bw][b_comp_mask]
+        comp_min_dE_bg = float(np.min(comp_dE_bg))
+        comp_p25_dE_bg = float(np.percentile(comp_dE_bg, 25))
+
+        comp_min_ink = min_dE_to_ink[by:by+bh, bx:bx+bw][b_comp_mask]
+        comp_p25_ink = float(np.percentile(comp_min_ink, 25))
+
+        # If component is clearly genuine background rather than an ink-to-ink seam/pinhole,
+        # NEVER seal it!
+        if comp_min_dE_bg <= 24.0 or (comp_p25_dE_bg + 4.0 < comp_p25_ink):
+            continue
+
+        fg_mask[by:by+bh, bx:bx+bw][b_comp_mask] = True
+        clean_alpha[by:by+bh, bx:bx+bw][b_comp_mask] = 1.0
+        sealed_pinholes += int(np.sum(b_comp_mask))
+
+    if verbose and sealed_pinholes > 0:
+        print(f"    Post-Alpha Topological Pinhole Seal: sealed {sealed_pinholes} accidental sub-threshold pinhole pixels")
+
+    # 8. Generalized Low-Gradient Voronoi Split Consolidation
+    k_star = consolidate_low_gradient_voronoi_splits(
+        k_star=k_star,
+        fg_mask=fg_mask,
+        P_lab=P_lab,
+        ink_rgbs=ink_rgbs,
+        max_dE_pair=28.0,
+        max_p75_grad=4.5,
+        verbose=verbose,
+    )
+
     ink_colors_arr = np.array(ink_rgbs, dtype=np.float32)
     quantized_rgb = ink_colors_arr[k_star]
 
     flat_quantized = np.zeros((H, W, 3), dtype=np.uint8)
-    fg_mask = clean_alpha >= 0.50
-    flat_quantized[:] = np.clip(np.round(B), 0, 255).astype(np.uint8)
+    flat_quantized[:] = np.clip(np.round(bg_flat_rgb), 0, 255).astype(np.uint8)
     flat_quantized[fg_mask] = np.clip(np.round(quantized_rgb[fg_mask]), 0, 255).astype(np.uint8)
 
     return flat_quantized, k_star, clean_alpha, dist_to_bg
+
+def consolidate_raster_speckles(
+    k_star: np.ndarray,
+    fg_mask: np.ndarray,
+    ink_rgbs: Optional[List[np.ndarray]] = None,
+    filter_speckle: int = 16,
+    num_passes: int = 2,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Consolidates small foreground ink speckles and transition slivers (< filter_speckle)
+    into adjacent foreground inks before VTracer vectorization.
+    Prevents VTracer from discarding tiny intermediate ink patches and cutting holes inside solid art.
+    High-contrast intentional dots (dE >= 24.0 to modal neighbor) with area >= 6 px are strictly preserved.
+    Freestanding isolated foreground dots surrounded by background are preserved.
+    """
+    if filter_speckle <= 0:
+        return k_star
+
+    k_out = k_star.copy()
+    H, W = k_star.shape
+    k_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+    for pass_idx in range(num_passes):
+        total_reassigned = 0
+        unique_inks = np.unique(k_out[fg_mask])
+        for k in unique_inks:
+            ink_mask = fg_mask & (k_out == k)
+            if not np.any(ink_mask):
+                continue
+
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                ink_mask.astype(np.uint8), connectivity=8
+            )
+
+            for lbl in range(1, num_labels):
+                area = stats[lbl, cv2.CC_STAT_AREA]
+                if area >= filter_speckle:
+                    continue
+
+                x = stats[lbl, cv2.CC_STAT_LEFT]
+                y = stats[lbl, cv2.CC_STAT_TOP]
+                w = stats[lbl, cv2.CC_STAT_WIDTH]
+                h = stats[lbl, cv2.CC_STAT_HEIGHT]
+
+                px0 = max(0, x - 1)
+                py0 = max(0, y - 1)
+                px1 = min(W, x + w + 1)
+                py1 = min(H, y + h + 1)
+
+                comp_local = (labels[py0:py1, px0:px1] == lbl)
+                dilated_local = cv2.dilate(comp_local.astype(np.uint8), k_dil) > 0
+                fg_local = fg_mask[py0:py1, px0:px1]
+                neighbor_fg = dilated_local & (~comp_local) & fg_local
+
+                if np.any(neighbor_fg):
+                    neighbor_inks = k_out[py0:py1, px0:px1][neighbor_fg]
+                    counts = np.bincount(neighbor_inks)
+                    modal_ink = int(np.argmax(counts))
+
+                    if modal_ink == k:
+                        continue
+
+                    if ink_rgbs is not None:
+                        Ck_lab = cv2.cvtColor(
+                            np.clip(ink_rgbs[k] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32),
+                            cv2.COLOR_RGB2LAB
+                        )[0, 0]
+                        Cm_lab = cv2.cvtColor(
+                            np.clip(ink_rgbs[modal_ink] / 255.0, 0.0, 1.0).reshape(1, 1, 3).astype(np.float32),
+                            cv2.COLOR_RGB2LAB
+                        )[0, 0]
+                        dE_km = float(np.linalg.norm(Ck_lab - Cm_lab))
+                        # High-contrast features (dE >= 24.0) with area >= 6 px are intentional dots/stars/accents,
+                        # NEVER absorb them! Only absorb low-contrast transition slivers (dE < 24.0 or area < 6).
+                        if dE_km >= 24.0 and area >= 6:
+                            continue
+
+                    k_out[py0:py1, px0:px1][comp_local] = modal_ink
+                    total_reassigned += area
+
+        if verbose and total_reassigned > 0:
+            print(f"    Speckle consolidation pass {pass_idx + 1}: {total_reassigned} pixels absorbed into adjacent inks")
+        if total_reassigned == 0:
+            break
+
+    return k_out
+
+
+def inject_seam_backing_underlay(
+    svg_path: str,
+    k_star: np.ndarray,
+    fg_mask: np.ndarray,
+    ink_rgbs: List[np.ndarray],
+    canonical_hexes: List[str],
+    bg_flat_rgb: np.ndarray,
+    vtracer_bin: Optional[str] = None,
+    verbose: bool = False,
+) -> int:
+    """
+    Generalized Internal Seam-Backing Underlay (Zero Exterior Bleed, Zero Cross-Color Contamination):
+    1. Computes safe_interior via distance_transform_edt(fg_mask) > 2.5 (strictly > 2.5px inset from every outer edge & cutout hole).
+    2. Identifies all internal ink-to-ink seams inside fg_mask (where 2+ different foreground inks meet within 3x3).
+    3. Dilates seams into a compact ~4-5px seam_zone masked strictly by safe_interior.
+    4. Across each internal seam, dilates the lower-luminance (darker) ink by ~2-3px across the seam (via cv2.erode
+       on luminance-ranked index inside 5x5 ellipse), creating a single continuous solid vector ribbon spanning across
+       the seam underneath both top paths (guaranteeing 0.0px spline separation gaps).
+    5. Traces seam_zone with VTracer, strips background paths, snaps fills to canonical_hexes,
+       and prepends them to svg_path as underlays.
+    """
+    K = len(ink_rgbs)
+    if K < 2 or not np.any(fg_mask):
+        return 0
+
+    safe_interior = scipy.ndimage.distance_transform_edt(fg_mask) > 2.5
+    if not np.any(safe_interior):
+        return 0
+
+    # Detect all internal ink-to-ink seams inside fg_mask
+    is_seam = fg_mask & (
+        scipy.ndimage.maximum_filter(k_star, size=3) != scipy.ndimage.minimum_filter(k_star, size=3)
+    )
+    if not np.any(is_seam & safe_interior):
+        return 0
+
+    k_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    seam_zone = (cv2.dilate((is_seam & safe_interior).astype(np.uint8), k_zone) > 0) & safe_interior
+    if not np.any(seam_zone):
+        return 0
+
+    # Rank inks by luminance (darkest to lightest)
+    lum = [
+        0.2126 * float(c[0]) + 0.7152 * float(c[1]) + 0.0722 * float(c[2])
+        for c in ink_rgbs
+    ]
+    sorted_inks = sorted(range(K), key=lambda k: lum[k])
+    rank_of_k = np.zeros(K, dtype=np.int32)
+    for rank, k_idx in enumerate(sorted_inks):
+        rank_of_k[k_idx] = rank
+    k_of_rank = np.array(sorted_inks, dtype=np.int32)
+
+    # Across each internal seam inside seam_zone, dilate the lower-luminance (darker) ink
+    # by ~3-4px across the seam (cv2.erode on luminance-ranked index inside 9x9, mapped back to k_star)
+    # so ONE single continuous vector ribbon spans right across the seam line underneath BOTH top paths.
+    rank_map = np.where(fg_mask, rank_of_k[k_star], K)
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    min_rank_map = cv2.erode(
+        rank_map.astype(np.uint8),
+        k_erode
+    )
+    clamped_rank = np.minimum(min_rank_map, K - 1)
+    seam_k = k_of_rank[clamped_rank]
+
+    H, W = fg_mask.shape
+    seam_raster = np.zeros((H, W, 3), dtype=np.uint8)
+    seam_raster[:] = np.clip(np.round(bg_flat_rgb), 0, 255).astype(np.uint8)
+    ink_colors_arr = np.array(ink_rgbs, dtype=np.float32)
+    seam_raster[seam_zone] = np.clip(np.round(ink_colors_arr[seam_k[seam_zone]]), 0, 255).astype(np.uint8)
+
+    vtracer_exe = resolve_vtracer_bin(vtracer_bin)
+    with tempfile.TemporaryDirectory() as td:
+        temp_seam_png = os.path.join(td, "seam_raster.png")
+        temp_seam_svg = os.path.join(td, "seam_raw.svg")
+        Image.fromarray(seam_raster).save(temp_seam_png)
+
+        vtracer_cmd = [
+            vtracer_exe,
+            "--input", temp_seam_png,
+            "--output", temp_seam_svg,
+            "--colormode", "color",
+            "--hierarchical", "cutout",
+            "--mode", "spline",
+            "--filter_speckle", "1",
+            "--color_precision", "8",
+            "--corner_threshold", "55",
+        ]
+        subprocess.run(vtracer_cmd, check=True, timeout=120, capture_output=True, text=True)
+
+        ET.register_namespace("", "http://www.w3.org/2000/svg")
+        seam_tree = ET.parse(temp_seam_svg)
+        seam_root = seam_tree.getroot()
+
+        backing_elements = []
+        for elem in seam_root.iter():
+            tag = elem.tag.split("}")[-1]
+            if tag not in ("path", "polygon"):
+                continue
+
+            fill_str = elem.attrib.get("fill", "")
+            if not fill_str and "style" in elem.attrib:
+                for part in elem.attrib["style"].split(";"):
+                    if part.strip().startswith("fill:"):
+                        fill_str = part.strip().split(":")[1].strip()
+                        break
+            if not fill_str or not fill_str.startswith("#"):
+                continue
+
+            c = hex_to_rgb_255(fill_str)
+            dist_b = float(np.linalg.norm(c - bg_flat_rgb))
+            ink_dists = [float(np.linalg.norm(c - ink_rgb)) for ink_rgb in ink_rgbs]
+            min_ink_dist = min(ink_dists)
+            if dist_b < min_ink_dist:
+                continue
+
+            best_k = int(np.argmin(ink_dists))
+            elem.attrib["fill"] = canonical_hexes[best_k]
+            if "style" in elem.attrib:
+                parts = [p.strip() for p in elem.attrib["style"].split(";") if p.strip()]
+                new_parts = [p for p in parts if not p.startswith("fill:")]
+                if new_parts:
+                    elem.attrib["style"] = ";".join(new_parts)
+                else:
+                    del elem.attrib["style"]
+
+            backing_elements.append(copy.deepcopy(elem))
+
+        if not backing_elements:
+            return 0
+
+        main_tree = ET.parse(svg_path)
+        main_root = main_tree.getroot()
+
+        insert_idx = 0
+        for i, child in enumerate(list(main_root)):
+            ctag = child.tag.split("}")[-1]
+            if ctag in ("path", "polygon", "rect"):
+                insert_idx = i
+                break
+
+        for b_elem in reversed(backing_elements):
+            main_root.insert(insert_idx, b_elem)
+
+        main_tree.write(svg_path, encoding="utf-8", xml_declaration=True)
+        if verbose:
+            print(f"    Injected {len(backing_elements)} internal seam-backing underlay paths into {svg_path}")
+        return len(backing_elements)
 
 
 def run_vector_knockout(
@@ -1770,7 +2454,7 @@ def run_vector_knockout(
     """
     Executes Candidate B vector prepress knockout workflow:
     Real-ESRGAN (2x) + Continuous Background Field B(x,y) + Spot-Color Palette Determination +
-    Strict Spot-Color Ray Unmixing & 7x7 Local Core Support + Strictly Flat (K+1)-Color Raster +
+    Strict Spot-Color Ray Unmixing & 9x9 Local Core Support (4px radius at 2x resolution) + Strictly Flat (K+1)-Color Raster +
     Cutout Spline VTracer + Background Path Stripping & Exact Canonical Hex Snapping +
     Clean Scalable Cutout SVG + resvg 300 DPI RGBA Render.
     """
@@ -1812,6 +2496,7 @@ def run_vector_knockout(
         manual_bg_rgb=manual_bg_rgb,
     )
     bg_rgb_255 = (mean_B * 255.0).astype(np.float32)
+    B_field_255 = (B_field * 255.0).astype(np.float32)
 
     # Step 3: Determine Spot-Color Palette
     if explicit_ink_rgbs is not None and explicit_canonical_hexes is not None:
@@ -1824,7 +2509,7 @@ def run_vector_knockout(
             print(f"Auto-discovering spot-color palette (target inks={inks}, merge_hue_tol={merge_hue_tol})...")
         ink_rgbs, canonical_hexes = discover_palette(
             img_rgb=img_2x_u8,
-            bg_rgb=bg_rgb_255,
+            bg_rgb=B_field_255,
             inks=inks,
             merge_hue_tol=merge_hue_tol,
             verbose=verbose,
@@ -1837,15 +2522,17 @@ def run_vector_knockout(
     seal_boxes_2x = [(x0 * 2, y0 * 2, x1 * 2, y1 * 2, r * 2) for (x0, y0, x1, y1, r) in (seal_boxes or [])]
     protect_polys_2x = [p * 2 for p in (protect_polys or [])]
 
-    # Step 4: Strict Spot-Color Ray Unmixing & 7x7 Local Core Support
+    # Step 4: Strict Spot-Color Ray Unmixing & 9x9 Local Core Support
     if verbose:
-        print(f"Unmixing 2x raster with {len(ink_rgbs)} spot inks + 7x7 local core support...")
+        print(f"Unmixing 2x raster with {len(ink_rgbs)} spot inks + 9x9 local core support...")
     t_unmix = time.perf_counter()
     P_f32 = img_2x_u8.astype(np.float32)
     flat_quantized, k_star, clean_alpha, dist_to_bg = unmix_spot_colors(
         P=P_f32,
-        B=bg_rgb_255,
+        B=B_field_255,
         ink_rgbs=ink_rgbs,
+        bg_flat_rgb=bg_rgb_255,
+        protect_interior_boxes_2x=protect_interior_boxes_2x,
         protect_boxes_2x=protect_boxes_2x,
         cutout_boxes_2x=cutout_boxes_2x,
         protect_polys_2x=protect_polys_2x,
@@ -1855,8 +2542,23 @@ def run_vector_knockout(
     if verbose:
         print(f"Ray unmixing & local core support finished in {time.perf_counter() - t_unmix:.2f}s")
 
+    # Step 4b: Pre-VTracer Raster Speckle Consolidation
+    fg_mask = clean_alpha >= 0.50
+    if filter_speckle > 0:
+        k_star = consolidate_raster_speckles(
+            k_star=k_star,
+            fg_mask=fg_mask,
+            ink_rgbs=ink_rgbs,
+            filter_speckle=filter_speckle,
+            num_passes=2,
+            verbose=verbose,
+        )
+        ink_colors_arr = np.array(ink_rgbs, dtype=np.float32)
+        flat_quantized[fg_mask] = np.clip(np.round(ink_colors_arr[k_star[fg_mask]]), 0, 255).astype(np.uint8)
+
     # Step 5: Run VTracer on flat_quantized raster
     vtracer_exe = resolve_vtracer_bin(vtracer_bin)
+    vt_filter_speckle = min(filter_speckle, 4) if filter_speckle > 0 else 0
     with tempfile.TemporaryDirectory() as td:
         temp_flat_png = os.path.join(td, "flat_quantized_2x.png")
         temp_raw_svg = os.path.join(td, "vtracer_raw.svg")
@@ -1869,7 +2571,7 @@ def run_vector_knockout(
             "--colormode", "color",
             "--hierarchical", "cutout",
             "--mode", "spline",
-            "--filter_speckle", str(filter_speckle),
+            "--filter_speckle", str(vt_filter_speckle),
             "--color_precision", "8",
             "--corner_threshold", "55",
         ]
@@ -1878,7 +2580,7 @@ def run_vector_knockout(
         t_vt = time.perf_counter()
         subprocess.run(vtracer_cmd, check=True, timeout=120, capture_output=True, text=True)
         if verbose:
-            print(f"VTracer finished in {time.perf_counter() - t_vt:.2f}s")
+            print(f"VTracer finished in {time.perf_counter() - t_vt:.2f}s (raw SVG size: {os.path.getsize(temp_raw_svg)} bytes)")
 
         # Step 6: Clean SVG, Strip Background Paths & Snap to Exact Canonical Hexes
         cutout_count = clean_vtracer_svg(
@@ -1897,6 +2599,20 @@ def run_vector_knockout(
             protect_polys_2x=protect_polys_2x,
             verbose=verbose,
         )
+
+        # Step 6b: Inject Seam-Backing Underlay Paths
+        backing_count = inject_seam_backing_underlay(
+            svg_path=output_svg,
+            k_star=k_star,
+            fg_mask=fg_mask,
+            ink_rgbs=ink_rgbs,
+            canonical_hexes=canonical_hexes,
+            bg_flat_rgb=bg_rgb_255,
+            vtracer_bin=vtracer_bin,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"Injected {backing_count} seam-backing underlay paths")
 
     # Step 7: Render Clean Cutout SVG to W x H RGBA via resvg_py
     if verbose:
@@ -2232,7 +2948,7 @@ def main() -> None:
         "--filter-speckle",
         type=int,
         default=16,
-        help="VTracer --filter_speckle threshold: discard patches smaller than X px (default: 16)",
+        help="Raster speckle consolidation threshold: absorbs low-contrast transition slivers < X px into adjacent inks before VTracer (default: 16; VTracer spline filter_speckle is clamped to min(X, 4))",
     )
     parser.add_argument(
         "--merge-hue-tol",
@@ -2345,6 +3061,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--verify-crops-dir",
+        "--crops-dir",
+        dest="verify_crops_dir",
         help="Directory to save 1:1 native-resolution diagnostic inspection crop strips",
     )
     parser.add_argument(

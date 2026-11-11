@@ -13,7 +13,7 @@
 # ///
 
 """
-knockout_quantize.py - Spot-Color Ray Unmixing & Cutout Spline VTracer SVG + Decoupled Prepress Knockout
+prepress_vectorize.py - Spot-Color Ray Unmixing & Cutout Spline VTracer SVG + Decoupled Prepress Vectorization
 
 Universal, mathematically rigorous prepress CLI tool for background removal, spot-color unmixing, and vectorization.
 Decomposes illustration artwork into production-grade vector Cutout SVGs or transparent PNGs:
@@ -2159,7 +2159,7 @@ def generate_detail_crops(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Universal Prepress Knockout Background Removal & Alpha Unmixing (PyMatting + Known-B)",
+        description="Universal Prepress Vectorize & Decontamination (Spot-Color Unmixing + Cutout Spline VTracer SVG)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input", help="Path to input image file (JPEG, PNG, WebP)")
@@ -2624,7 +2624,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
-        print(f"=== KNOCKOUT QUANTIZE COMPLETE ({t_total:.2f}s) ===")
+        print(f"=== PREPRESS VECTORIZE COMPLETE ({t_total:.2f}s) ===")
         print(f"  Dimensions:        {w_orig}x{h_orig} px @ {dpi[0]} DPI (100% native preserved)")
         print(f"  Print Mode:        {mode.upper()}" + (" (Spot-Color Unmixing + Cutout Spline VTracer SVG)" if mode == "vector" else ""))
         if mode == "vector":

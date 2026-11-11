@@ -1,7 +1,7 @@
 {
   "name": "pixelpress",
-  "version": "0.2.0",
-  "description": "Production-grade graphic and illustration prepress tools for Antigravity (AGY), featuring Real-ESRGAN + Edge-Snap + VTracer Cutout SVG vectorization, Chroma-Smoothed PyMatting knockout background removal, and silkscreen spot-color quantization.",
+  "version": "0.3.0",
+  "description": "Production-grade graphic and illustration prepress tools for Antigravity (AGY), featuring Real-ESRGAN 2x super-resolution + Spot-Color Unmixing (Interior Solid CIELAB Guard + Boundary Fractional-Alpha Ray Unmixing with 7x7 Core Support) + (K+1) Cutout Spline VTracer SVG vectorization & canonical hex snapping, alongside continuous DTG/DTF alpha matting and raster screenprint separation.",
   "author": {
     "name": "bryant"
   },
@@ -9,11 +9,13 @@
   "keywords": [
     "image-processing",
     "vector",
+    "vectorize",
+    "prepress-vectorize",
     "vtracer",
     "svg",
     "realesrgan",
     "screen-print",
-    "knockout",
+    "spot-color",
     "quantization",
     "alpha-unmixing",
     "graphic-design",

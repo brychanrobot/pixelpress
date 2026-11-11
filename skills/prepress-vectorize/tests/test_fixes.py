@@ -22,7 +22,7 @@ import pytest
 # Import module under test
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-from knockout_quantize import (
+from prepress_vectorize import (
     discover_palette,
     unmix_spot_colors,
     clean_vtracer_svg,

@@ -1,11 +1,11 @@
 ---
-name: knockout-quantize
-description: Knockout background removal, continuous color decontaminating unmixing (DTG/Web), and discrete spot-color screen-print quantization for illustrations and apparel graphics.
+name: prepress-vectorize
+description: Production-grade vector prepress, spot-color unmixing, cutout SVG vectorization, and continuous alpha unmixing (DTG/DTF) for illustrations and apparel graphics.
 ---
 
-# Knockout Background Removal, Continuous Unmixing & Discrete Color Quantization
+# Prepress Vectorization, Spot-Color Unmixing & Cutout SVG Extraction
 
-`knockout-quantize` is a mathematically rigorous CLI tool and workflow for decomposing graphic artwork (JPEG, PNG, WebP) into production-grade transparent PNGs and scalable cut-ready SVGs with pristine, fringe-free edges. Its primary, default workflow is **`--mode vector`** (Candidate B: Strict Spot-Color Ray Unmixing & `(K+1)`-Palette Quantization -> Cutout Spline VTracer SVG) designed specifically for vector-style artwork, graphic illustrations, anime, cel-shaded art, logos, and typography, alongside continuous raster unmixing modes (`dtg`, `dtf`, `screenprint`).
+`prepress-vectorize` is a mathematically rigorous CLI tool and workflow for decomposing graphic artwork (JPEG, PNG, WebP) into production-grade transparent PNGs and scalable cut-ready SVGs with pristine, fringe-free edges. Its primary, default workflow is **`--mode vector`** (Candidate B: Strict Spot-Color Ray Unmixing & `(K+1)`-Palette Quantization -> Cutout Spline VTracer SVG) designed specifically for vector-style artwork, graphic illustrations, anime, cel-shaded art, logos, and typography, alongside continuous raster unmixing modes (`dtg`, `dtf`, `screenprint`).
 
 ---
 
@@ -121,10 +121,10 @@ In prepress and apparel screen printing, downscaling or altering image resolutio
 
 ## CLI Tool Reference
 
-The CLI tool is located at `skills/knockout-quantize/scripts/knockout_quantize.py`. It is a self-contained PEP 723 script executable via `uv run`:
+The CLI tool is located at `skills/prepress-vectorize/scripts/prepress_vectorize.py`. It is a self-contained PEP 723 script executable via `uv run`:
 
 ```bash
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py [OPTIONS] <input-image>
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py [OPTIONS] <input-image>
 ```
 
 ### Options & Arguments
@@ -172,13 +172,13 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 
 ## Standard Workflows
 
-### Workflow 1: Vector Prepress Knockout & Cutout SVG (Primary Default)
+### Workflow 1: Vector Prepress Vectorization & Cutout SVG (Primary Default)
 
 For vector-style artwork, graphic illustrations, anime, cel-shaded art, logos, and typography:
 
 ```bash
 # Auto-discover 2..6 spot inks via CIELAB silhouette scoring:
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode vector \
   -o artwork_transparent.png \
@@ -187,7 +187,7 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
   --verify-crops-dir ./crops
 
 # Or with an explicit physical spot-color palette:
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode vector \
   --palette "#DDA032,#CBB39B,#EFE0CE" \
@@ -202,7 +202,7 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 For digital direct-to-garment printing where artist gradients and continuous shading must be preserved without color banding:
 
 ```bash
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode dtg \
   -o artwork_transparent.png \
@@ -215,7 +215,7 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 For DTF heat transfers requiring a steeper alpha dropoff to prevent hot-melt adhesive powder from clinging to faint edge mist:
 
 ```bash
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode dtf \
   --dtf-alpha-floor 0.15 \
@@ -229,7 +229,7 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 When separating illustration artwork into discrete spot-color ink channels with binary mesh stencil boundaries:
 
 ```bash
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode screenprint \
   --colors 6 \
@@ -241,7 +241,7 @@ uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knocko
 Or with an explicit physical spot-color palette:
 
 ```bash
-uv run /home/bryant/fast/code/pixelpress/skills/knockout-quantize/scripts/knockout_quantize.py \
+uv run /home/bryant/fast/code/pixelpress/skills/prepress-vectorize/scripts/prepress_vectorize.py \
   artwork.jpg \
   --mode screenprint \
   --palette "#552308,#D08915,#F3D5BA,#824B21,#BE7A4F,#EDBB5F" \
